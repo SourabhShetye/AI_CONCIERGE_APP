@@ -1,0 +1,38 @@
+# Environment files - NEVER commit these
+.env
+.env.local
+.env.production
+.env.*
+
+# Python
+# ─── Python / Backend ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+venv/
+.venv/
+virenv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.pyc
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.next/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
