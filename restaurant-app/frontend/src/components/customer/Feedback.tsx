@@ -2,12 +2,15 @@ import { useState } from 'react'
 import { Star } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { feedbackApi } from '@/services/api'
+import { useAuth } from '@/contexts/AuthContext'
+
 
 export default function Feedback() {
   const [overall, setOverall] = useState(0)
   const [comments, setComments] = useState('')
   const [submitted, setSubmitted] = useState(false)
-  const restaurantId = import.meta.env.VITE_RESTAURANT_ID
+  const { user } = useAuth()
+  const restaurantId = user?.restaurant_id || import.meta.env.VITE_RESTAURANT_ID
 
   const handleSubmit = async () => {
     if (!overall) return toast.error('Please give an overall rating')

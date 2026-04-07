@@ -9,6 +9,7 @@ import Booking from './Booking'
 import MyOrders from './MyOrders'
 import Bill from './Bill'
 import Feedback from './Feedback'
+import { useState } from 'react'
 
 const TABS = [
   { path: '/customer/menu',     label: 'Order',    icon: UtensilsCrossed },
@@ -20,6 +21,15 @@ const TABS = [
 
 export default function CustomerApp() {
   const { user, logout } = useAuth()
+  const [restaurantName, setRestaurantName] = useState('Restaurant')
+  const restaurantId = user?.restaurant_id || import.meta.env.VITE_RESTAURANT_ID
+  useEffect(() => {
+    // Fetch the restaurant name to show in the header
+    fetch(`${import.meta.env.VITE_API_URL}/api/restaurant/${restaurantId}`)
+      .then(r => r.json())
+      .then(data => { if (data.name) setRestaurantName(data.name) })
+      .catch(() => {}) // silently fail — fallback stays as 'Restaurant'
+  }, [restaurantId])
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -30,21 +40,36 @@ export default function CustomerApp() {
 
     const unsubscribe = ws.on((event) => {
       switch (event.type) {
-        case 'order_ready':
-          toast.success('🔔 Your order is ready! Please collect it.', { duration: 8000 })
+        case 'order_ready': {
+          const msg = (event.data as any).chat_message || '🔔 Your order is ready! Please collect it.'
+          toast.success(msg, { duration: 8000 })
+          window.dispatchEvent(new CustomEvent('chat_notification', { detail: { message: msg } }))
           break
-        case 'order_cancelled':
-          toast.error('Your order cancellation was approved.')
+        }
+        case 'order_cancelled': {
+          const msg = (event.data as any).chat_message || '✅ Your cancellation was approved.'
+          toast.success(msg, { duration: 6000 })
+          window.dispatchEvent(new CustomEvent('chat_notification', { detail: { message: msg } }))
           break
-        case 'modification_approved':
-          toast.success('✅ Your order modification was approved.')
+        }
+        case 'modification_approved': {
+          const msg = (event.data as any).chat_message || '✅ Your modification was approved.'
+          toast.success(msg, { duration: 6000 })
+          window.dispatchEvent(new CustomEvent('chat_notification', { detail: { message: msg } }))
           break
-        case 'modification_rejected':
-          toast.error('❌ Modification rejected. Original order stands.')
+        }
+        case 'modification_rejected': {
+          const msg = (event.data as any).chat_message || '❌ Modification rejected. Original order stands.'
+          toast.error(msg, { duration: 6000 })
+          window.dispatchEvent(new CustomEvent('chat_notification', { detail: { message: msg } }))
           break
-        case 'cancellation_rejected':
-          toast.error('❌ Cancellation rejected. Your order is being prepared.')
+        }
+        case 'cancellation_rejected': {
+          const msg = (event.data as any).chat_message || '❌ Cancellation rejected. Your order is being prepared.'
+          toast.error(msg, { duration: 6000 })
+          window.dispatchEvent(new CustomEvent('chat_notification', { detail: { message: msg } }))
           break
+        }
         case 'feedback_requested':
           toast('🌟 Your table has been closed. Please leave feedback!', {
             icon: '⭐',
@@ -71,7 +96,7 @@ export default function CustomerApp() {
       {/* Top header */}
       <header className="bg-white border-b border-gray-100 px-4 py-3 flex items-center justify-between sticky top-0 z-10">
         <div>
-          <h1 className="font-bold text-gray-900">🍽️ Restaurant</h1>
+          <h1 className="font-bold text-gray-900">🍽️ {restaurantName}</h1>
           {user && (
             <p className="text-xs text-gray-500">
               Hi, {user.name}

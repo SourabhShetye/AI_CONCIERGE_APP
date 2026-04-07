@@ -19,28 +19,30 @@ function ProtectedStaff({ children }: { children: React.ReactNode }) {
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<LandingPage />} />
-      <Route path="/customer/login" element={<CustomerLogin />} />
-      <Route
-        path="/customer/*"
-        element={
-          <ProtectedCustomer>
-            <CustomerApp />
-          </ProtectedCustomer>
-        }
-      />
-      <Route path="/staff/login" element={<StaffLogin />} />
-      <Route
-        path="/staff/*"
-        element={
-          <ProtectedStaff>
-            <StaffApp />
-          </ProtectedStaff>
-        }
-      />
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
-    <ChatWidget />
+    <>
+      <Routes>
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/customer/login" element={<CustomerLogin />} />
+        <Route
+          path="/customer/*"
+          element={
+            <ProtectedCustomer>
+              <CustomerApp />
+            </ProtectedCustomer>
+          }
+        />
+        <Route path="/staff/login" element={<StaffLogin />} />
+        <Route
+          path="/staff/*"
+          element={
+            <ProtectedStaff>
+              <StaffApp />
+            </ProtectedStaff>
+          }
+        />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+      <ChatWidget />
+    </>
   )
 }

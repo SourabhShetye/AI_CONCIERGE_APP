@@ -131,8 +131,13 @@ def build_menu_context(menu_items: list[dict]) -> str:
     lines = []
     for item in menu_items:
         status = " [SOLD OUT]" if item.get("sold_out") else ""
+        # Include common shorthand names so AI can match "mojito" → "Signature Mojito"
+        name = item['name']
+        words = name.lower().split()
+        shortcuts = [w for w in words if len(w) > 3 and w not in ('with','and','the','fresh','grilled')]
+        shorthand = f" (also: {', '.join(shortcuts)})" if len(shortcuts) < len(words) else ""
         lines.append(
-            f"- {item['name']}{status} | {item['category']} | AED {item['price']:.2f}"
+            f"- {name}{shorthand}{status} | {item['category']} | AED {item['price']:.2f}"
             + (f" | {item['description']}" if item.get("description") else "")
         )
     return "\n".join(lines)
@@ -160,28 +165,33 @@ async def process_natural_language_order(
     menu_context = build_menu_context(menu_items)
     menu_names_lower = {item["name"].lower(): item for item in menu_items}
 
-    system_prompt = f"""You are an AI waiter for a restaurant. Your job is to parse customer orders.
+    system_prompt = f"""You are an AI waiter. Parse the customer's order into JSON.
 
-MENU:
+AVAILABLE MENU ITEMS (use EXACT names from this list):
 {menu_context}
+
+MATCHING RULES:
+- "mojito" matches "Signature Mojito"
+- "water" matches "Sparkling Water"  
+- "fondant" or "chocolate" matches "Chocolate Fondant"
+- "seabass" or "sea bass" or "fish" matches "Grilled Seabass"
+- "burger" or "wagyu" matches "Wagyu Burger"
+- "salad" or "burrata" matches "Burrata Salad"
+- Always match partial names to the closest menu item
+- If you cannot match an item at all, add it to unrecognized_items
+- NEVER include sold out items
 
 {f"RESTAURANT NOTES: {ai_context}" if ai_context else ""}
 
-RULES:
-1. Match items using fuzzy matching (e.g. "burger" → closest menu item)
-2. NEVER include sold-out items in the order
-3. Use exact menu prices — never guess
-4. Return ONLY valid JSON in this exact format:
+Return ONLY this JSON format, no other text:
 {{
   "items": [
-    {{"name": "Full Stack Burger", "quantity": 2, "unit_price": 45.0, "total_price": 90.0}}
+    {{"name": "Signature Mojito", "quantity": 1, "unit_price": 45.0, "total_price": 45.0}}
   ],
-  "total": 90.0,
-  "unrecognized_items": ["pizza"],
-  "sold_out_items": ["Fish & Chips"]
-}}
-
-Do not add any explanation or preamble — JSON only."""
+  "total": 45.0,
+  "unrecognized_items": [],
+  "sold_out_items": []
+}}"""
 
     try:
         client = get_groq()
@@ -196,6 +206,7 @@ Do not add any explanation or preamble — JSON only."""
         )
         raw = response.choices[0].message.content or ""
         logger.info(f"Groq raw response: {raw[:300]}")
+        logger.info(f"Menu sent to Groq ({len(menu_items)} items): {menu_context[:200]}")
 
     except Exception as e:
         logger.error(f"Groq API error: {e}")

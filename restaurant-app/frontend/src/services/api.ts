@@ -11,18 +11,24 @@ export const api = axios.create({ baseURL: BASE_URL })
 
 // Attach JWT to every request automatically
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('token')
+  const token = sessionStorage.getItem('token')
   if (token) config.headers.Authorization = `Bearer ${token}`
   return config
 })
 
-// On 401, clear token and redirect to home
+// On 401, only redirect to home if it's NOT a login attempt
+// Login failures should show an error message, not redirect
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401) {
-      localStorage.removeItem('token')
-      localStorage.removeItem('user')
+    const isLoginEndpoint =
+      err.config?.url?.includes('/customer/login') ||
+      err.config?.url?.includes('/customer/register') ||
+      err.config?.url?.includes('/staff/login')
+
+    if (err.response?.status === 401 && !isLoginEndpoint) {
+      sessionStorage.removeItem('token')
+      sessionStorage.removeItem('user')
       window.location.href = '/'
     }
     return Promise.reject(err)

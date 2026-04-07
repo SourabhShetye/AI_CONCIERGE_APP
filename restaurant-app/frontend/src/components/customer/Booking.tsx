@@ -3,6 +3,7 @@ import { CalendarDays, Clock, Users, X } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { bookingApi } from '@/services/api'
 import type { Booking } from '@/types'
+import { useAuth } from '@/contexts/AuthContext'
 import { format, addDays, parseISO } from 'date-fns'
 
 export default function Booking() {
@@ -12,7 +13,8 @@ export default function Booking() {
   const [time, setTime] = useState('19:00')
   const [specialRequests, setSpecialRequests] = useState('')
   const [loading, setLoading] = useState(false)
-  const restaurantId = import.meta.env.VITE_RESTAURANT_ID
+  const { user } = useAuth()
+  const restaurantId = user?.restaurant_id || import.meta.env.VITE_RESTAURANT_ID
 
   const fetchBookings = async () => {
     try {

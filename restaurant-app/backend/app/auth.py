@@ -1,7 +1,8 @@
 """
 auth.py - JWT token creation/verification + bcrypt password hashing.
 """
-
+import logging
+logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -42,6 +43,7 @@ def decode_token(token: str) -> dict:
         payload = jwt.decode(
             token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
         )
+        logger.info(f"JWT payload keys: {list(payload.keys())} restaurant={payload.get('restaurant_id')}")
         return payload
     except JWTError:
         raise HTTPException(

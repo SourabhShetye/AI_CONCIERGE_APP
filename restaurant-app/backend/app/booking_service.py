@@ -39,18 +39,30 @@ def parse_booking_datetime(iso_string: str) -> Optional[datetime]:
 
 def validate_booking_time(booking_time: datetime) -> tuple[bool, str]:
     """
-    Validate that the booking time satisfies business rules.
+    Validate that the booking time satisfies all business rules.
     Returns (is_valid, error_message).
     """
     now = get_dubai_now()
 
     # Must be in the future
     if booking_time <= now:
-        return False, "Booking time must be in the future."
+        return False, f"That date and time ({booking_time.strftime('%d %B %Y at %I:%M %p')}) is in the past."
 
     # Must be at least BOOKING_ADVANCE_HOURS from now
     if booking_time < now + timedelta(hours=BOOKING_ADVANCE_HOURS):
-        return False, f"Bookings must be made at least {BOOKING_ADVANCE_HOURS} hours in advance."
+        earliest = now + timedelta(hours=BOOKING_ADVANCE_HOURS)
+        return False, (
+            f"Bookings must be made at least {BOOKING_ADVANCE_HOURS} hours in advance. "
+            f"The earliest available slot is {earliest.strftime('%d %B at %I:%M %p')}."
+        )
+
+    # Must not be more than 3 months in advance
+    three_months_ahead = now + timedelta(days=90)
+    if booking_time > three_months_ahead:
+        return False, (
+            f"Bookings can only be made up to 3 months in advance. "
+            f"The latest available date is {three_months_ahead.strftime('%d %B %Y')}."
+        )
 
     return True, ""
 

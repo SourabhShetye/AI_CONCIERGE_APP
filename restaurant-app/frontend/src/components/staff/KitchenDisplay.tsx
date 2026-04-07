@@ -164,7 +164,12 @@ function OrderCard({ order, accentClass, actions }: { order: Order; accentClass:
     <div className={`card border-2 ${accentClass} space-y-3`}>
       <div className="flex justify-between items-start">
         <div>
-          <p className="font-bold text-lg">Table {order.table_number}</p>
+          <p className="font-bold text-lg">
+          Table {order.table_number}
+          {(order as any).daily_order_number
+            ? <span className="ml-2 text-sm font-normal text-gray-500">Order #{(order as any).daily_order_number}</span>
+            : null}
+        </p>
           <p className="text-sm text-gray-600">{order.customer_name}</p>
         </div>
         <span className="text-xs text-gray-400">
@@ -184,6 +189,18 @@ function OrderCard({ order, accentClass, actions }: { order: Order; accentClass:
           <span>AED {order.price.toFixed(2)}</span>
         </div>
       </div>
+
+      {(order as any).modification_status === 'requested' && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-2 mt-1">
+          <p className="text-xs font-semibold text-blue-700 mb-0.5">Modification requested:</p>
+          <p className="text-xs text-blue-600">{(order as any).modification_text || 'See order details'}</p>
+        </div>
+      )}
+      {(order as any).cancellation_status === 'requested' && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-2 mt-1">
+          <p className="text-xs font-semibold text-red-700">Customer requesting cancellation</p>
+        </div>
+      )}  
 
       {order.allergy_warnings?.length ? (
         <div className="bg-orange-100 rounded-lg p-2">

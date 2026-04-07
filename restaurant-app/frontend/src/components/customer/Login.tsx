@@ -11,6 +11,15 @@ type Mode = 'login' | 'register'
 const ALLERGEN_OPTIONS = ['Gluten', 'Dairy', 'Nuts', 'Shellfish', 'Eggs', 'Soy']
 
 export default function CustomerLogin() {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const { login } = useAuth()
+
+  // Derive these BEFORE any useState calls that use them
+  const restaurantId = searchParams.get('restaurant') || import.meta.env.VITE_RESTAURANT_ID
+  const qrTable = searchParams.get('table') || ''
+
+  // State declarations — qrTable is now defined above so this works
   const [mode, setMode] = useState<Mode>('login')
   const [name, setName] = useState('')
   const [pin, setPin] = useState('')
@@ -20,14 +29,6 @@ export default function CustomerLogin() {
   const [allergies, setAllergies] = useState<string[]>([])
   const [showPin, setShowPin] = useState(false)
   const [loading, setLoading] = useState(false)
-  
-  const navigate = useNavigate()
-  const [searchParams] = useSearchParams()
-  const { login } = useAuth()
-
-  // QR codes pass restaurant_id and table as URL params
-  const restaurantId = searchParams.get('restaurant') || import.meta.env.VITE_RESTAURANT_ID
-  const qrTable = searchParams.get('table') || ''
 
   const toggleAllergen = (a: string) =>
     setAllergies((prev) => (prev.includes(a) ? prev.filter((x) => x !== a) : [...prev, a]))
@@ -36,7 +37,9 @@ export default function CustomerLogin() {
     if (!name.trim()) return toast.error('Please enter your name.')
     if (pin.length !== 4) return toast.error('PIN must be exactly 4 digits.')
     if (mode === 'register' && pin !== confirmPin) return toast.error('PINs do not match.')
+    if (!tableNumber.trim()) return toast.error('Please enter your table number.')
 
+    sessionStorage.clear()  // always start fresh — prevents stale staff tokens bleeding in
     setLoading(true)
     try {
       const payload = { name: name.trim(), pin, restaurant_id: restaurantId, table_number: tableNumber || undefined }
@@ -46,6 +49,13 @@ export default function CustomerLogin() {
 
       const user: AuthUser = { ...res.data, role: 'customer' }
       login(user)
+      // Store table number and restaurant for this session
+      if (tableNumber) {
+        sessionStorage.setItem(`table_${user.user_id}`, tableNumber)
+      }
+      sessionStorage.setItem('restaurant_id', restaurantId)
+      // Persist restaurant_id so chat widget can read it after URL changes
+      localStorage.setItem('restaurant_id', restaurantId)
 
       if (mode === 'login' && res.data.visit_count > 0) {
         toast.success(`Welcome back, ${user.name}! Visit #${res.data.visit_count} 🎉`)
@@ -108,10 +118,20 @@ export default function CustomerLogin() {
             </div>
           )}
 
-          {/* Table number */}
+          {/* Table number — required before ordering */}
           <div>
-            <label className="text-sm font-medium text-gray-700 mb-1 block">Table Number (optional)</label>
-            <input className="input" placeholder="e.g. 5" value={tableNumber} onChange={(e) => setTableNumber(e.target.value)} />
+            <label className="text-sm font-medium text-gray-700 mb-1 block">
+              Table Number <span className="text-red-500">*</span>
+            </label>
+            <input
+              className="input"
+              placeholder="e.g. 5 — ask your server if unsure"
+              value={tableNumber}
+              onChange={(e) => setTableNumber(e.target.value.replace(/\D/g, ''))}
+            />
+            <p className="text-xs text-gray-400 mt-1">
+              Required to place orders. Check the number on your table.
+            </p>
           </div>
 
           {/* PIN */}

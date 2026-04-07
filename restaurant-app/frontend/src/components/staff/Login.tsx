@@ -13,13 +13,13 @@ export default function StaffLogin() {
   const [loading, setLoading] = useState(false)
   const { login } = useAuth()
   const navigate = useNavigate()
-  const restaurantId = import.meta.env.VITE_RESTAURANT_ID
-
   const handleLogin = async () => {
-    if (!username || !password) return toast.error('Please fill all fields')
-    setLoading(true)
-    try {
-      const res = await authApi.staffLogin({ username, password, restaurant_id: restaurantId })
+  if (!username || !password) return toast.error('Please fill all fields')
+  sessionStorage.clear()  // always start fresh
+  setLoading(true)
+  try {
+    // Don't send restaurant_id — backend finds it by username match across all restaurants
+    const res = await authApi.staffLogin({ username, password })
       const user: AuthUser = { ...res.data }
       login(user)
       toast.success(`Welcome, ${username}! (${res.data.role})`)

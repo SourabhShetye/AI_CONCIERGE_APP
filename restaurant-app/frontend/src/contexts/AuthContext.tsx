@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
+import { createContext, useContext, useState, ReactNode } from 'react'
 import type { AuthUser } from '@/types'
 
 interface AuthContextType {
@@ -12,10 +12,14 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | null>(null)
 
+// Use sessionStorage so each browser tab is fully independent
+// Tab 1 = customer, Tab 2 = staff — no interference
+const storage = sessionStorage
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(() => {
     try {
-      const stored = localStorage.getItem('user')
+      const stored = storage.getItem('user')
       return stored ? JSON.parse(stored) : null
     } catch {
       return null
@@ -23,14 +27,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   })
 
   const login = (authUser: AuthUser) => {
-    localStorage.setItem('token', authUser.access_token)
-    localStorage.setItem('user', JSON.stringify(authUser))
+    storage.setItem('token', authUser.access_token)
+    storage.setItem('user', JSON.stringify(authUser))
     setUser(authUser)
   }
 
   const logout = () => {
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
+    storage.clear()
     setUser(null)
   }
 

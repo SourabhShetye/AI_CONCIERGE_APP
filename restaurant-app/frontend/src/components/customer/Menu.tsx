@@ -17,10 +17,10 @@ export default function Menu() {
   const [ordering, setOrdering] = useState(false)
   const [orderResult, setOrderResult] = useState<PlaceOrderResponse | null>(null)
   const [showCart, setShowCart] = useState(false)
-  const { user } = useAuth()
   const { cart, addItem, removeItem, updateQty, clearCart, total, itemCount } = useCart()
 
-  const restaurantId = import.meta.env.VITE_RESTAURANT_ID
+  const { user } = useAuth()
+  const restaurantId = user?.restaurant_id || import.meta.env.VITE_RESTAURANT_ID
 
   useEffect(() => {
     menuApi.getMenu(restaurantId)
@@ -47,16 +47,16 @@ export default function Menu() {
   // Natural language order submission
   const handleNLOrder = async () => {
     if (!nlInput.trim()) return toast.error('Please describe your order.')
-    const tableNumber = user ? localStorage.getItem(`table_${user.user_id}`) || '' : ''
+    const tableNumber = user ? sessionStorage.getItem(`table_${user.user_id}`) || '' : ''
 
     if (!tableNumber) {
       // Ask for table number
       const tbl = window.prompt('Please enter your table number:')
       if (!tbl) return
-      if (user) localStorage.setItem(`table_${user.user_id}`, tbl)
+      if (user) sessionStorage.setItem(`table_${user.user_id}`, tbl)
     }
 
-    const tbl = localStorage.getItem(`table_${user?.user_id}`) || ''
+    const tbl = sessionStorage.getItem(`table_${user?.user_id}`) || ''
     setOrdering(true)
     try {
       const res = await orderApi.placeOrder({
@@ -82,13 +82,13 @@ export default function Menu() {
   // Cart-based order
   const handleCartOrder = async () => {
     if (!cart.length) return
-    const tableNumber = localStorage.getItem(`table_${user?.user_id}`) || ''
+    const tableNumber = sessionStorage.getItem(`table_${user?.user_id}`) || ''
     if (!tableNumber) {
       const tbl = window.prompt('Please enter your table number:')
       if (!tbl) return
-      if (user) localStorage.setItem(`table_${user.user_id}`, tbl)
+      if (user) sessionStorage.setItem(`table_${user.user_id}`, tbl)
     }
-    const tbl = localStorage.getItem(`table_${user?.user_id}`) || ''
+    const tbl = sessionStorage.getItem(`table_${user?.user_id}`) || ''
     const nlText = cart.map((e) => `${e.quantity} ${e.item.name}`).join(', ')
     setOrdering(true)
     try {

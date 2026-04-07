@@ -31,8 +31,17 @@ export default function MyOrders() {
 
   useEffect(() => {
     fetchOrders()
-    const interval = setInterval(fetchOrders, 10000) // Refresh every 10s
+    const interval = setInterval(fetchOrders, 5000) // faster refresh: 5s instead of 10s
     return () => clearInterval(interval)
+  }, [])
+
+  // Also refresh when tab becomes visible (e.g. switching from chat)
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') fetchOrders()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
   }, [])
 
   const handleCancel = async (id: string) => {

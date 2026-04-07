@@ -1,8 +1,3 @@
-"""
-config.py - Application settings loaded from environment variables.
-Uses pydantic-settings so every variable is validated at startup.
-"""
-
 from pydantic_settings import BaseSettings
 
 
@@ -12,7 +7,7 @@ class Settings(BaseSettings):
     groq_api_key: str
     jwt_secret: str
     jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = 1440  # 24 hours
+    jwt_expire_minutes: int = 1440
     default_restaurant_id: str
     allowed_origins: str = "http://localhost:5173"
 
@@ -22,6 +17,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"   # ← this silently ignores any extra keys in .env
 
 
 settings = Settings()  # type: ignore
