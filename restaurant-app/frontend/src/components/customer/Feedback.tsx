@@ -4,22 +4,29 @@ import toast from 'react-hot-toast'
 import { feedbackApi } from '@/services/api'
 import { useAuth } from '@/contexts/AuthContext'
 
-
 export default function Feedback() {
+  const { user } = useAuth()
+  const { submitted, setSubmitted } = useFeedbackSession(user?.user_id)
   const [overall, setOverall] = useState(0)
   const [comments, setComments] = useState('')
-  const [submitted, setSubmitted] = useState(false)
-  const { user } = useAuth()
-  const restaurantId = user?.restaurant_id || import.meta.env.VITE_RESTAURANT_ID
+  const [submitting, setSubmitting] = useState(false)
+  const restaurantId = import.meta.env.VITE_RESTAURANT_ID
 
   const handleSubmit = async () => {
     if (!overall) return toast.error('Please give an overall rating')
+    setSubmitting(true)
     try {
-      await feedbackApi.submit({ overall_rating: overall, comments: comments || undefined, restaurant_id: restaurantId })
+      await feedbackApi.submit({
+        overall_rating: overall,
+        comments: comments || undefined,
+        restaurant_id: restaurantId,
+      })
       setSubmitted(true)
       toast.success('Thank you for your feedback! 🌟')
     } catch {
       toast.error('Failed to submit feedback')
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -28,7 +35,12 @@ export default function Feedback() {
       <div className="flex flex-col items-center justify-center h-64 p-4">
         <div className="text-6xl mb-4">🙏</div>
         <h3 className="text-xl font-bold text-gray-800">Thank You!</h3>
-        <p className="text-gray-500 text-sm mt-2">We hope to see you again soon.</p>
+        <p className="text-gray-500 text-sm mt-2 text-center">
+          Your feedback has been recorded for this visit.
+        </p>
+        <p className="text-gray-400 text-xs mt-1">
+          You can submit feedback again on your next visit.
+        </p>
       </div>
     )
   }
@@ -44,7 +56,11 @@ export default function Feedback() {
             <button key={n} onClick={() => setOverall(n)}>
               <Star
                 size={36}
-                className={`transition-colors ${n <= overall ? 'text-yellow-400 fill-yellow-400' : 'text-gray-300'}`}
+                className={`transition-colors ${
+                  n <= overall
+                    ? 'text-yellow-400 fill-yellow-400'
+                    : 'text-gray-300'
+                }`}
               />
             </button>
           ))}
@@ -61,9 +77,33 @@ export default function Feedback() {
         />
       </div>
 
-      <button onClick={handleSubmit} className="btn-primary w-full">
-        Submit Feedback
+      <button
+        onClick={handleSubmit}
+        disabled={submitting}
+        className="btn-primary w-full"
+      >
+        {submitting ? 'Submitting...' : 'Submit Feedback'}
       </button>
     </div>
   )
+}
+
+// ── Session-scoped feedback state ─────────────────────────────────────────────
+// Uses sessionStorage so it resets on logout (session cleared) but persists
+// across tab switches within the same session.
+
+function useFeedbackSession(userId: string | undefined) {
+  // Key is user-specific so different users on same device don't share state
+  const key = `feedback_submitted_${userId || 'guest'}`
+
+  const [submitted, setSubmittedState] = useState<boolean>(() => {
+    return sessionStorage.getItem(key) === 'true'
+  })
+
+  const setSubmitted = (val: boolean) => {
+    sessionStorage.setItem(key, String(val))
+    setSubmittedState(val)
+  }
+
+  return { submitted, setSubmitted }
 }

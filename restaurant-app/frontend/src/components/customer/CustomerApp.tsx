@@ -92,7 +92,7 @@ export default function CustomerApp() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col max-w-2xl mx-auto">
+    <div className="min-h-screen bg-gray-50 flex flex-col max-w-2xl">
       {/* Top header */}
       <header className="bg-white border-b border-gray-100 px-4 py-3 flex items-center justify-between sticky top-0 z-10">
         <div>
@@ -122,7 +122,7 @@ export default function CustomerApp() {
       </main>
 
       {/* Bottom nav */}
-      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 flex max-w-2xl mx-auto">
+      <nav className="fixed bottom-0 left-0 bg-white border-t border-gray-100 flex w-full max-w-2xl">
         {TABS.map(({ path, label, icon: Icon }) => {
           const active = location.pathname === path
           return (

@@ -23,7 +23,22 @@ export default function Booking() {
     } catch {}
   }
 
-  useEffect(() => { fetchBookings() }, [])
+  useEffect(() => {
+    fetchBookings()
+    // Refresh when tab becomes visible (e.g. switching from chat)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') fetchBookings()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [])
+
+  // Listen for booking_placed event from the chat widget
+  useEffect(() => {
+    const handler = () => fetchBookings()
+    window.addEventListener('booking_placed', handler)
+    return () => window.removeEventListener('booking_placed', handler)
+  }, [])
 
   const handleBook = async () => {
     const booking_time = `${date}T${time}:00`

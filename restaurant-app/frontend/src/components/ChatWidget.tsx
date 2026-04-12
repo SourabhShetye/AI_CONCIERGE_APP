@@ -10,9 +10,8 @@ interface Message {
 }
 
 type ChatMode = 'general' | 'ordering' | 'booking'
-
-// State machine pending actions — mirrors backend
-type PendingAction = 'cancel_selection' | 'mod_selection' | 'mod_details' | null
+type PendingAction = 'cancel_selection' | 'mod_selection' | 'mod_details' |
+  'cancel_type_selection' | 'cancel_item_selection' | null
 
 interface ChatState {
   mode: ChatMode
@@ -32,9 +31,7 @@ function loadChatState(): ChatState {
   try {
     const s = sessionStorage.getItem('chat_state')
     return s ? JSON.parse(s) : DEFAULT_STATE
-  } catch {
-    return DEFAULT_STATE
-  }
+  } catch { return DEFAULT_STATE }
 }
 
 function saveChatState(state: ChatState) {
@@ -51,11 +48,7 @@ export default function ChatWidget() {
         return parsed.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) }))
       }
     } catch {}
-    return [{
-      role: 'assistant' as const,
-      content: 'Hi! How can I help you today?',
-      timestamp: new Date(),
-    }]
+    return [{ role: 'assistant' as const, content: 'Hi! How can I help you today?', timestamp: new Date() }]
   })
   const [chatState, setChatState] = useState<ChatState>(loadChatState)
   const [input, setInput] = useState('')
@@ -70,17 +63,13 @@ export default function ChatWidget() {
     || sessionStorage.getItem('restaurant_id')
     || import.meta.env.VITE_RESTAURANT_ID
 
-  // Persist messages to sessionStorage
   useEffect(() => {
     if (messages.length > 1) {
       sessionStorage.setItem('chat_messages', JSON.stringify(messages))
     }
   }, [messages])
 
-  // Persist chat state to sessionStorage
-  useEffect(() => {
-    saveChatState(chatState)
-  }, [chatState])
+  useEffect(() => { saveChatState(chatState) }, [chatState])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -92,16 +81,12 @@ export default function ChatWidget() {
     }
   }, [open])
 
-  // Listen for kitchen notifications (approve/reject) and show in chat
+  // Kitchen notification handler
   useEffect(() => {
     const handler = (e: Event) => {
       const msg = (e as CustomEvent).detail?.message
       if (msg) {
-        setMessages(prev => [...prev, {
-          role: 'assistant',
-          content: msg,
-          timestamp: new Date(),
-        }])
+        setMessages(prev => [...prev, { role: 'assistant', content: msg, timestamp: new Date() }])
         setOpen(true)
       }
     }
@@ -138,7 +123,7 @@ export default function ChatWidget() {
           })
           const data = await res.json()
           if (data.text) setInput(data.text)
-        } catch { /* silent fail */ }
+        } catch {}
         finally { setLoading(false) }
       }
       mediaRecorder.start()
@@ -156,7 +141,6 @@ export default function ChatWidget() {
   const sendMessage = async () => {
     if (!input.trim() || loading) return
 
-    // Ensure table number exists before ordering
     let tableNumber = user ? sessionStorage.getItem(`table_${user.user_id}`) : null
     if (!tableNumber && chatState.mode === 'ordering') {
       const tbl = window.prompt('Please enter your table number before ordering:')
@@ -176,58 +160,39 @@ export default function ChatWidget() {
         mode: chatState.mode,
         restaurant_id: restaurantId,
         table_number: tableNumber || null,
-        conversation_history: messages.slice(-8).map(m => ({
-          role: m.role,
-          content: m.content,
-        })),
-        // Send current state machine state to backend
+        conversation_history: messages.slice(-8).map(m => ({ role: m.role, content: m.content })),
         pending_action: chatState.pendingAction,
         pending_order_id: chatState.pendingOrderId,
         pending_order_num: chatState.pendingOrderNum,
       })
 
       const {
-        reply,
-        new_mode,
-        new_pending_action,
-        new_pending_order_id,
-        new_pending_order_num,
-        order_placed,
-        order_total,
-        order_number,
-        booking_placed,
-        booking_summary,
-        cancellation_requested,
-        modification_requested,
+        reply, new_mode, new_pending_action, new_pending_order_id, new_pending_order_num,
+        order_placed, order_total, order_number, booking_placed, booking_summary,
+        booking_datetime_iso,
       } = res.data
 
-      // Update state machine state
-      const newState: ChatState = {
+      setChatState({
         mode: (new_mode as ChatMode) || chatState.mode,
         pendingAction: new_pending_action || null,
         pendingOrderId: new_pending_order_id || null,
         pendingOrderNum: new_pending_order_num || null,
-      }
-      setChatState(newState)
+      })
 
-      // Build reply message — add confirmation suffix if needed
       let displayReply = reply
       if (order_placed && order_total) {
         displayReply = `${reply}\n\n✅ Order #${order_number} placed! Total: AED ${Number(order_total).toFixed(2)}. Check your Orders tab.`
       } else if (booking_placed && booking_summary) {
         displayReply = `${reply}\n\n✅ Booking confirmed! ${booking_summary}. Check your Bookings tab.`
+        // Fire event so Booking tab refreshes immediately
+        window.dispatchEvent(new CustomEvent('booking_placed'))
       }
 
       addMessage('assistant', displayReply)
 
     } catch (err: any) {
       const detail = err.response?.data?.detail
-      addMessage('assistant',
-        typeof detail === 'string'
-          ? `Error: ${detail}`
-          : 'Sorry, something went wrong. Please try again.'
-      )
-      // Reset state machine on error
+      addMessage('assistant', typeof detail === 'string' ? `Error: ${detail}` : 'Sorry, something went wrong.')
       setChatState(DEFAULT_STATE)
     } finally {
       setLoading(false)
@@ -237,20 +202,17 @@ export default function ChatWidget() {
   const clearChat = () => {
     sessionStorage.removeItem('chat_messages')
     sessionStorage.removeItem('chat_state')
-    setMessages([{
-      role: 'assistant',
-      content: 'Hi! How can I help you today?',
-      timestamp: new Date(),
-    }])
+    setMessages([{ role: 'assistant', content: 'Hi! How can I help you today?', timestamp: new Date() }])
     setChatState(DEFAULT_STATE)
   }
 
   const tableNumber = user ? sessionStorage.getItem(`table_${user.user_id}`) : null
 
-  // Input placeholder changes based on state
   const getPlaceholder = () => {
     if (recording) return '🎙️ Recording...'
     if (chatState.pendingAction === 'cancel_selection') return 'e.g. "cancel order #2"'
+    if (chatState.pendingAction === 'cancel_type_selection') return '"full" or "partial"'
+    if (chatState.pendingAction === 'cancel_item_selection') return 'Which item to remove?'
     if (chatState.pendingAction === 'mod_selection') return 'e.g. "order #3"'
     if (chatState.pendingAction === 'mod_details') return 'Describe your change...'
     if (chatState.mode === 'ordering') return '"2 burgers and a coffee"'
@@ -260,11 +222,11 @@ export default function ChatWidget() {
 
   return (
     <>
-      {/* Floating button */}
+      {/* Floating button — only when closed */}
       {!open && (
         <button
           onClick={() => setOpen(true)}
-          className="fixed bottom-6 right-6 z-50 w-14 h-14 rounded-full bg-gradient-to-br from-primary-500 to-primary-600 text-white shadow-lg hover:shadow-xl hover:scale-105 transition-all flex items-center justify-center"
+          className="fixed bottom-6 right-6 z-40 w-14 h-14 rounded-full bg-gradient-to-br from-primary-500 to-primary-600 text-white shadow-lg hover:shadow-xl hover:scale-105 transition-all flex items-center justify-center"
         >
           <MessageCircle size={24} />
           {chatState.pendingAction && (
@@ -273,56 +235,69 @@ export default function ChatWidget() {
         </button>
       )}
 
-      {/* Chat drawer */}
+      {/* 
+        Chat panel layout:
+        - Mobile: bottom sheet, full width, 85vh tall
+        - Tablet/Desktop: side panel on the RIGHT, does NOT cover the main content
+          The panel is fixed to the right edge, the main content stays accessible
+          on the left side of the screen
+      */}
       {open && (
-        <div className="fixed bottom-0 right-0 z-50 flex items-end sm:items-end sm:justify-end sm:p-6 pointer-events-none">
+        <>
+          {/* Mobile backdrop only — on desktop we DON'T block the background */}
           <div
-            className="absolute inset-0 bg-black/30 sm:hidden pointer-events-auto"
+            className="fixed inset-0 bg-black/30 z-40 sm:hidden"
             onClick={() => setOpen(false)}
           />
 
-          <div className="relative bg-white w-full sm:w-96 h-[85vh] sm:h-[600px] rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col pointer-events-auto">
-
+          {/* Chat panel */}
+          <div className="
+            fixed z-40
+            bottom-0 right-0
+            w-full
+            h-[85vh]
+            sm:w-[380px]
+            sm:bottom-4 sm:right-4
+            sm:h-[min(calc(100vh-80px),640px)]
+            bg-white
+            rounded-t-3xl sm:rounded-2xl
+            shadow-2xl
+            flex flex-col
+            sm:border sm:border-gray-100
+          ">
             {/* Header */}
-            <div className="bg-gradient-to-r from-primary-500 to-primary-600 text-white px-5 py-4 rounded-t-3xl sm:rounded-t-2xl flex justify-between items-center">
+            <div className="bg-gradient-to-r from-primary-500 to-primary-600 text-white px-5 py-4 rounded-t-3xl sm:rounded-t-2xl flex justify-between items-center flex-shrink-0">
               <div>
                 <p className="font-bold">AI Concierge</p>
                 <p className="text-xs text-white/70">
-                  {chatState.pendingAction === 'cancel_selection' && '⏳ Waiting for order number (cancel)'}
-                  {chatState.pendingAction === 'mod_selection' && '⏳ Waiting for order number (modify)'}
-                  {chatState.pendingAction === 'mod_details' && `⏳ Waiting for change details — Order #${chatState.pendingOrderNum}`}
+                  {chatState.pendingAction === 'cancel_selection' && '⏳ Select order to cancel'}
+                  {chatState.pendingAction === 'cancel_type_selection' && '⏳ Full or partial?'}
+                  {chatState.pendingAction === 'cancel_item_selection' && '⏳ Which item to remove?'}
+                  {chatState.pendingAction === 'mod_selection' && '⏳ Select order to modify'}
+                  {chatState.pendingAction === 'mod_details' && `⏳ Order #${chatState.pendingOrderNum}`}
                   {!chatState.pendingAction && `Mode: ${chatState.mode}`}
                   {tableNumber ? ` · Table ${tableNumber}` : ' · No table set'}
                 </p>
               </div>
               <div className="flex items-center gap-3">
-                <button
-                  onClick={clearChat}
-                  className="text-xs text-white/60 hover:text-white transition-colors"
-                >
+                <button onClick={clearChat} className="text-xs text-white/60 hover:text-white">
                   Clear
                 </button>
-                <button onClick={() => setOpen(false)} className="hover:opacity-70 transition-opacity">
+                <button onClick={() => setOpen(false)} className="hover:opacity-70">
                   <X size={20} />
                 </button>
               </div>
             </div>
 
             {/* Mode pills — disabled during pending state */}
-            <div className="flex gap-2 px-4 py-2 border-b border-gray-100">
+            <div className="flex gap-2 px-4 py-2 border-b border-gray-100 flex-shrink-0">
               {(['general', 'ordering', 'booking'] as ChatMode[]).map(m => (
                 <button
                   key={m}
-                  onClick={() => {
-                    if (!chatState.pendingAction) {
-                      setChatState(prev => ({ ...prev, mode: m }))
-                    }
-                  }}
+                  onClick={() => !chatState.pendingAction && setChatState(prev => ({ ...prev, mode: m }))}
                   disabled={!!chatState.pendingAction}
                   className={`px-3 py-1 rounded-full text-xs font-medium transition-all ${
-                    chatState.mode === m
-                      ? 'bg-primary-500 text-white'
-                      : 'bg-gray-100 text-gray-500'
+                    chatState.mode === m ? 'bg-primary-500 text-white' : 'bg-gray-100 text-gray-500'
                   } ${chatState.pendingAction ? 'opacity-50 cursor-not-allowed' : ''}`}
                 >
                   {m}
@@ -331,7 +306,7 @@ export default function ChatWidget() {
             </div>
 
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            <div className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0">
               {messages.map((msg, i) => (
                 <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <div className={`max-w-[85%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-line ${
@@ -346,12 +321,9 @@ export default function ChatWidget() {
               {loading && (
                 <div className="flex justify-start">
                   <div className="bg-gray-100 px-4 py-3 rounded-2xl rounded-bl-sm flex gap-1">
-                    {[0, 1, 2].map(i => (
-                      <div
-                        key={i}
-                        className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"
-                        style={{ animationDelay: `${i * 150}ms` }}
-                      />
+                    {[0,1,2].map(i => (
+                      <div key={i} className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"
+                        style={{ animationDelay: `${i * 150}ms` }} />
                     ))}
                   </div>
                 </div>
@@ -360,13 +332,13 @@ export default function ChatWidget() {
             </div>
 
             {/* Input */}
-            <div className="p-4 border-t border-gray-100 flex gap-2">
+            <div className="p-4 border-t border-gray-100 flex gap-2 flex-shrink-0">
               <button
                 onMouseDown={startRecording}
                 onMouseUp={stopRecording}
                 onTouchStart={startRecording}
                 onTouchEnd={stopRecording}
-                className={`px-3 py-2 rounded-xl border-2 transition-all ${
+                className={`px-3 py-2 rounded-xl border-2 transition-all flex-shrink-0 ${
                   recording
                     ? 'border-red-400 bg-red-50 text-red-500 animate-pulse'
                     : 'border-gray-200 text-gray-400 hover:border-primary-300'
@@ -376,7 +348,7 @@ export default function ChatWidget() {
                 <Mic size={16} />
               </button>
               <input
-                className="input flex-1 text-sm"
+                className="input flex-1 text-sm min-w-0"
                 placeholder={getPlaceholder()}
                 value={input}
                 onChange={e => setInput(e.target.value)}
@@ -385,14 +357,13 @@ export default function ChatWidget() {
               <button
                 onClick={sendMessage}
                 disabled={loading}
-                className="btn-primary px-3 py-2"
+                className="btn-primary px-3 py-2 flex-shrink-0"
               >
                 <Send size={16} />
               </button>
             </div>
-
           </div>
-        </div>
+        </>
       )}
     </>
   )

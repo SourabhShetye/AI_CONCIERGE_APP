@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Receipt, RefreshCw } from 'lucide-react'
+import { Receipt, RefreshCw, ChevronDown, ChevronUp, Clock } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { api } from '@/services/api'
 import { useAuth } from '@/contexts/AuthContext'
@@ -19,13 +19,23 @@ interface Order {
   status: string
   daily_order_number?: number
   created_at: string
+  table_number?: string
+}
+
+interface PastSession {
+  date: string
+  table_number: string
+  orders: Order[]
+  total: number
 }
 
 interface BillData {
   table_number: string | null
-  orders: Order[]
-  total: number
+  active_orders: Order[]
+  active_total: number
   is_paid: boolean
+  past_sessions: PastSession[]
+  lifetime_total: number
 }
 
 export default function Bill() {
@@ -33,14 +43,14 @@ export default function Bill() {
   const [bill, setBill] = useState<BillData | null>(null)
   const [loading, setLoading] = useState(true)
   const [paid, setPaid] = useState(false)
+  const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set())
 
   const fetchBill = useCallback(async () => {
     try {
       const res = await api.get('/api/my-bill')
       setBill(res.data)
-      // If no orders, table may have been closed
-      if (!res.data.orders || res.data.orders.length === 0) {
-        setPaid(true)
+      if (res.data.is_paid && res.data.active_orders.length === 0) {
+        // Don't auto-set paid — only set if explicitly closed via WebSocket
       }
     } catch (err: any) {
       if (err.response?.status === 404) {
@@ -55,7 +65,6 @@ export default function Bill() {
 
   useEffect(() => {
     fetchBill()
-    // Auto-refresh every 15 seconds until paid
     const interval = setInterval(() => {
       if (!paid) fetchBill()
     }, 15000)
@@ -65,16 +74,24 @@ export default function Bill() {
   // Listen for table-closed WebSocket event
   useEffect(() => {
     const handler = (e: Event) => {
-      const type = (e as CustomEvent).detail?.type
-      if (type === 'table_closed') {
+      const detail = (e as CustomEvent).detail
+      if (detail?.type === 'table_closed' || detail?.type === 'feedback_requested') {
         setPaid(true)
-        setBill(null)
+        fetchBill() // Refresh so past sessions update
         toast.success('Your bill has been processed. Thank you! 🙏')
       }
     }
     window.addEventListener('ws_event', handler)
     return () => window.removeEventListener('ws_event', handler)
-  }, [])
+  }, [fetchBill])
+
+  const toggleSession = (key: string) => {
+    setExpandedSessions(prev => {
+      const next = new Set(prev)
+      next.has(key) ? next.delete(key) : next.add(key)
+      return next
+    })
+  }
 
   if (loading) {
     return (
@@ -87,95 +104,148 @@ export default function Bill() {
     )
   }
 
-  if (paid) {
-    return (
-      <div className="flex flex-col items-center justify-center h-64 p-4">
-        <div className="text-6xl mb-4">✅</div>
-        <h3 className="text-xl font-bold text-gray-800">Bill Paid</h3>
-        <p className="text-gray-500 text-sm mt-2 text-center">
-          Your table has been closed. Thank you for dining with us!
-        </p>
-      </div>
-    )
-  }
-
-  if (!bill || bill.orders.length === 0) {
-    return (
-      <div className="p-4 space-y-4">
-        <div className="flex justify-between items-center">
-          <h2 className="text-xl font-bold flex items-center gap-2">
-            <Receipt size={22} /> My Bill
-          </h2>
-          <button onClick={fetchBill} className="text-gray-400 hover:text-primary-500">
-            <RefreshCw size={18} />
-          </button>
-        </div>
-        <div className="card text-center py-12 text-gray-400">
-          <p className="text-4xl mb-3">🧾</p>
-          <p>No active orders yet.</p>
-          <p className="text-sm mt-1">Orders will appear here once placed.</p>
-        </div>
-      </div>
-    )
-  }
-
   return (
-    <div className="p-4 space-y-4">
+    <div className="p-4 space-y-5">
+      {/* Header */}
       <div className="flex justify-between items-center">
         <h2 className="text-xl font-bold flex items-center gap-2">
           <Receipt size={22} /> My Bill
         </h2>
-        <div className="flex items-center gap-3">
-          {bill.table_number && (
+        <div className="flex items-center gap-2">
+          {bill?.table_number && (
             <span className="badge bg-primary-100 text-primary-700">
               Table {bill.table_number}
             </span>
           )}
-          <button
-            onClick={fetchBill}
-            className="text-gray-400 hover:text-primary-500"
-            title="Refresh bill"
-          >
-            <RefreshCw size={18} />
+          <button onClick={fetchBill} className="text-gray-400 hover:text-primary-500">
+            <RefreshCw size={16} />
           </button>
         </div>
       </div>
 
-      <div className="card">
-        {bill.orders.map((order) => (
-          <div key={order.id} className="mb-4 pb-4 border-b border-gray-100 last:border-0">
-            <div className="flex justify-between items-center mb-2">
-              <p className="text-xs font-semibold text-gray-500">
-                {order.daily_order_number ? `Order #${order.daily_order_number}` : 'Order'}
-                {' · '}{order.customer_name}
-              </p>
-              <span className={`status-${order.status} text-xs`}>{order.status}</span>
-            </div>
-            {order.items.map((item, i) => (
-              <div key={i} className="flex justify-between text-sm py-0.5">
-                <span className="text-gray-700">
-                  {item.quantity}× {item.name}
-                </span>
-                <span className="text-gray-500">AED {item.total_price.toFixed(2)}</span>
-              </div>
-            ))}
-            <div className="flex justify-between text-sm font-medium mt-1 pt-1 border-t border-gray-50">
-              <span>Subtotal</span>
-              <span>AED {order.price.toFixed(2)}</span>
-            </div>
-          </div>
-        ))}
-
-        <div className="flex justify-between font-bold text-xl mt-2 pt-3 border-t-2 border-gray-200">
-          <span>Total</span>
-          <span className="text-primary-600">AED {bill.total.toFixed(2)}</span>
+      {/* ── Current Active Bill ─────────────────────────────────────────── */}
+      {paid ? (
+        <div className="card text-center py-8">
+          <div className="text-5xl mb-3">✅</div>
+          <h3 className="font-bold text-gray-800">Bill Paid</h3>
+          <p className="text-sm text-gray-500 mt-1">Thank you for dining with us!</p>
         </div>
+      ) : bill && bill.active_orders.length > 0 ? (
+        <div className="card border-primary-100">
+          <div className="flex justify-between items-center mb-3">
+            <h3 className="font-semibold text-gray-800">Current Bill</h3>
+            <span className="badge bg-green-100 text-green-700">Active</span>
+          </div>
 
-        <p className="text-xs text-gray-400 mt-4 text-center">
-          Ask your server to process payment when ready.
-          Your bill updates automatically as you order.
-        </p>
-      </div>
+          {bill.active_orders.map((order) => (
+            <div key={order.id} className="mb-3 pb-3 border-b border-gray-100 last:border-0">
+              <div className="flex justify-between items-center mb-1">
+                <p className="text-xs font-medium text-gray-500">
+                  {order.daily_order_number ? `Order #${order.daily_order_number}` : 'Order'}
+                  {' · '}{order.customer_name}
+                </p>
+                <span className={`status-${order.status} text-xs`}>{order.status}</span>
+              </div>
+              {order.items.map((item, i) => (
+                <div key={i} className="flex justify-between text-sm py-0.5">
+                  <span className="text-gray-700">{item.quantity}× {item.name}</span>
+                  <span className="text-gray-500">AED {item.total_price.toFixed(2)}</span>
+                </div>
+              ))}
+              <div className="flex justify-between text-xs font-medium text-gray-500 mt-1 pt-1 border-t border-gray-50">
+                <span>Subtotal</span>
+                <span>AED {order.price.toFixed(2)}</span>
+              </div>
+            </div>
+          ))}
+
+          <div className="flex justify-between font-bold text-xl pt-2 border-t-2 border-gray-200">
+            <span>Total Due</span>
+            <span className="text-primary-600">AED {bill.active_total.toFixed(2)}</span>
+          </div>
+          <p className="text-xs text-gray-400 mt-3 text-center">
+            Ask your server to process payment · Updates automatically
+          </p>
+        </div>
+      ) : (
+        <div className="card text-center py-8 text-gray-400">
+          <p className="text-4xl mb-3">🧾</p>
+          <p className="font-medium">No active orders</p>
+          <p className="text-sm mt-1">Orders will appear here once placed.</p>
+        </div>
+      )}
+
+      {/* ── Past Bill History ───────────────────────────────────────────── */}
+      {bill && bill.past_sessions.length > 0 && (
+        <div>
+          <div className="flex justify-between items-center mb-3">
+            <h3 className="font-semibold text-gray-700 flex items-center gap-2">
+              <Clock size={16} />
+              Past Bills
+            </h3>
+            <span className="text-xs text-gray-500">
+              Lifetime: AED {bill.lifetime_total.toFixed(2)}
+            </span>
+          </div>
+
+          <div className="space-y-3">
+            {bill.past_sessions.map((session, idx) => {
+              const key = `${session.date}-${session.table_number}-${idx}`
+              const isExpanded = expandedSessions.has(key)
+
+              return (
+                <div key={key} className="card border-gray-100">
+                  {/* Session header — always visible */}
+                  <button
+                    onClick={() => toggleSession(key)}
+                    className="w-full flex justify-between items-center"
+                  >
+                    <div className="text-left">
+                      <p className="font-medium text-sm text-gray-800">{session.date}</p>
+                      <p className="text-xs text-gray-500">
+                        Table {session.table_number} · {session.orders.length} order{session.orders.length > 1 ? 's' : ''}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-gray-700">
+                        AED {session.total.toFixed(2)}
+                      </span>
+                      {isExpanded
+                        ? <ChevronUp size={16} className="text-gray-400" />
+                        : <ChevronDown size={16} className="text-gray-400" />
+                      }
+                    </div>
+                  </button>
+
+                  {/* Session detail — expandable */}
+                  {isExpanded && (
+                    <div className="mt-3 pt-3 border-t border-gray-100 space-y-3">
+                      {session.orders.map((order) => (
+                        <div key={order.id}>
+                          <p className="text-xs text-gray-400 mb-1">
+                            {order.daily_order_number ? `Order #${order.daily_order_number}` : 'Order'}
+                            {' · '}{new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </p>
+                          {order.items.map((item, i) => (
+                            <div key={i} className="flex justify-between text-sm">
+                              <span className="text-gray-600">{item.quantity}× {item.name}</span>
+                              <span className="text-gray-500">AED {item.total_price.toFixed(2)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                      <div className="flex justify-between font-semibold text-sm pt-2 border-t border-gray-100">
+                        <span>Session Total</span>
+                        <span>AED {session.total.toFixed(2)}</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

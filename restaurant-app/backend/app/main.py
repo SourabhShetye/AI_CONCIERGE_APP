@@ -17,6 +17,7 @@ from fastapi import UploadFile, File
 from app.chat_service import process_chat
 from datetime import datetime, timezone
 from typing import Optional, List
+from app.staff_chat_service import process_staff_chat
 
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -673,6 +674,118 @@ async def reject_cancellation(order_id: str):
     })
     return {"detail": "Cancellation rejected."}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 2: STAFF AI CHAT
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StaffChatRequest(BaseModel):
+    message: str
+    conversation_history: list = []
+
+
+@app.post("/api/staff/chat")
+async def staff_chat(
+    req: StaffChatRequest,
+    current_user: dict = Depends(require_staff),
+):
+    """
+    Staff-only AI assistant with full operational context.
+    Can answer questions about orders, bookings, customers, revenue.
+    Can send messages to specific customer tables.
+    """
+    db = get_db()
+    restaurant_id = current_user["restaurant_id"]
+    staff_name = current_user.get("name", "Staff")
+    staff_role = current_user.get("role", "staff")
+
+    # Fetch all operational data
+    active_orders = (
+        db.table("orders")
+        .select("*")
+        .eq("restaurant_id", restaurant_id)
+        .not_.in_("status", ["completed", "cancelled"])
+        .order("created_at")
+        .execute()
+    ).data or []
+
+    for o in active_orders:
+        if isinstance(o.get("items"), str):
+            o["items"] = json.loads(o["items"])
+
+    # Upcoming bookings (next 7 days)
+    from datetime import timedelta as _td
+    now = datetime.now(timezone.utc)
+    week_ahead = (now + _td(days=7)).isoformat()
+    bookings = (
+        db.table("bookings")
+        .select("*")
+        .eq("restaurant_id", restaurant_id)
+        .not_.eq("status", "cancelled")
+        .gte("booking_time", now.isoformat())
+        .lte("booking_time", week_ahead)
+        .order("booking_time")
+        .execute()
+    ).data or []
+
+    menu = (
+        db.table("menu_items")
+        .select("*")
+        .eq("restaurant_id", restaurant_id)
+        .execute()
+    ).data or []
+
+    customers = (
+        db.table("user_sessions")
+        .select("*")
+        .eq("restaurant_id", restaurant_id)
+        .execute()
+    ).data or []
+
+    settings_row = (
+        db.table("restaurant_policies")
+        .select("ai_context")
+        .eq("restaurant_id", restaurant_id)
+        .execute()
+    )
+    ai_context = (settings_row.data[0].get("ai_context") or "") if settings_row.data else ""
+
+    from app.staff_chat_service import process_staff_chat
+    result = await process_staff_chat(
+        message=req.message,
+        restaurant_id=restaurant_id,
+        staff_name=staff_name,
+        staff_role=staff_role,
+        active_orders=active_orders,
+        bookings=bookings,
+        menu=menu,
+        customers=customers,
+        conversation_history=req.conversation_history,
+        ai_context=ai_context,
+    )
+
+    # ── Handle send_customer_message action ───────────────────────────────────
+    if result.get("action_type") == "send_customer_message":
+        action_data = result.get("action_data", {})
+        table_number = action_data.get("table_number")
+        customer_message = action_data.get("message", "")
+
+        if table_number and customer_message:
+            # Find customers at this table and send them a WebSocket message
+            seated = [
+                c for c in customers
+                if str(c.get("table_number")) == str(table_number)
+            ]
+            for customer in seated:
+                await manager.send_to_customer(customer["id"], "staff_message", {
+                    "message": customer_message,
+                    "from": "Restaurant",
+                    "chat_message": f"💬 Message from restaurant: {customer_message}",
+                })
+            logger.info(
+                f"Staff message sent to table {table_number}: {customer_message}"
+            )
+
+    return result
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TABLES & BILLING
@@ -800,15 +913,13 @@ async def close_table(table_number: str, current_user: dict = Depends(require_st
 @app.get("/api/my-bill")
 async def get_my_bill(current_user: dict = Depends(get_current_user)):
     """
-    Get the bill for the currently logged-in customer.
-    Uses their stored table_number — no need to type it again.
-    Only shows unpaid (non-completed, non-cancelled) orders.
+    Returns current active bill AND full past bill history
+    for this customer, grouped by visit date.
     """
     db = get_db()
     user_id = current_user["user_id"]
     restaurant_id = current_user.get("restaurant_id") or settings.default_restaurant_id
 
-    # Resolve user
     user_data = db.table("user_sessions").select(
         "id, table_number, name"
     ).eq("id", user_id).execute()
@@ -817,20 +928,10 @@ async def get_my_bill(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Session not found.")
 
     table_number = user_data.data[0].get("table_number")
-    if not table_number:
-        # Fall back to querying by user_id directly
-        result = (
-            db.table("orders")
-            .select("*")
-            .eq("user_id", user_id)
-            .eq("restaurant_id", restaurant_id)
-            .not_.in_("status", ["completed", "cancelled"])
-            .order("created_at")
-            .execute()
-        )
-    else:
-        # Get all orders for the table (handles group tables)
-        result = (
+
+    # ── Current active orders ─────────────────────────────────────────────────
+    if table_number:
+        active_result = (
             db.table("orders")
             .select("*")
             .eq("restaurant_id", restaurant_id)
@@ -839,19 +940,76 @@ async def get_my_bill(current_user: dict = Depends(get_current_user)):
             .order("created_at")
             .execute()
         )
+    else:
+        active_result = (
+            db.table("orders")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("restaurant_id", restaurant_id)
+            .not_.in_("status", ["completed", "cancelled"])
+            .order("created_at")
+            .execute()
+        )
 
-    orders = result.data
-    for o in orders:
+    active_orders = active_result.data or []
+    for o in active_orders:
         if isinstance(o.get("items"), str):
             o["items"] = json.loads(o["items"])
 
-    total = round(sum(float(o.get("price", 0)) for o in orders), 2)
+    active_total = round(sum(float(o.get("price", 0)) for o in active_orders), 2)
+
+    # ── Past completed orders (all time, this restaurant) ────────────────────
+    past_result = (
+        db.table("orders")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("restaurant_id", restaurant_id)
+        .eq("status", "completed")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    past_orders = past_result.data or []
+    for o in past_orders:
+        if isinstance(o.get("items"), str):
+            o["items"] = json.loads(o["items"])
+
+    # ── Group past orders by date ─────────────────────────────────────────────
+    from collections import defaultdict
+    past_by_date: dict = defaultdict(list)
+    for o in past_orders:
+        try:
+            created = datetime.fromisoformat(o["created_at"])
+            date_key = created.strftime("%d %B %Y")  # e.g. "15 January 2025"
+        except Exception:
+            date_key = "Unknown date"
+        past_by_date[date_key].append(o)
+
+    # Build past sessions (group by date + table)
+    past_sessions = []
+    for date_str, date_orders in past_by_date.items():
+        # Group by table within the date
+        table_groups: dict = defaultdict(list)
+        for o in date_orders:
+            tbl = o.get("table_number") or "Unknown"
+            table_groups[tbl].append(o)
+
+        for tbl, tbl_orders in table_groups.items():
+            session_total = round(sum(float(o.get("price", 0)) for o in tbl_orders), 2)
+            past_sessions.append({
+                "date": date_str,
+                "table_number": tbl,
+                "orders": tbl_orders,
+                "total": session_total,
+            })
 
     return {
         "table_number": table_number,
-        "orders": orders,
-        "total": total,
-        "is_paid": False,  # becomes True after table is closed
+        "active_orders": active_orders,
+        "active_total": active_total,
+        "is_paid": len(active_orders) == 0,
+        "past_sessions": past_sessions,
+        "lifetime_total": round(sum(s["total"] for s in past_sessions), 2),
     }
 
 @app.get("/api/bill/{table_number}")
@@ -875,53 +1033,66 @@ async def get_bill(table_number: str, restaurant_id: Optional[str] = None):
     return {"table_number": table_number, "orders": orders, "total": round(total, 2)}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 3: TABLE INVENTORY MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/staff/tables-inventory", dependencies=[Depends(require_staff)])
+async def get_tables_inventory(current_user: dict = Depends(require_staff)):
+    """Get all tables with their capacities for this restaurant."""
+    db = get_db()
+    result = (
+        db.table("tables_inventory")
+        .select("*")
+        .eq("restaurant_id", current_user["restaurant_id"])
+        .order("capacity")
+        .execute()
+    )
+    return result.data
+
+
+@app.post("/api/staff/tables-inventory", dependencies=[Depends(require_staff)])
+async def create_table(
+    table_data: dict,
+    current_user: dict = Depends(require_staff),
+):
+    """Add a new table to the inventory."""
+    db = get_db()
+    result = db.table("tables_inventory").insert({
+        "restaurant_id": current_user["restaurant_id"],
+        "table_number": str(table_data["table_number"]),
+        "capacity": int(table_data["capacity"]),
+        "is_active": table_data.get("is_active", True),
+    }).execute()
+    return result.data[0]
+
+
+@app.put("/api/staff/tables-inventory/{table_id}", dependencies=[Depends(require_staff)])
+async def update_table(table_id: str, table_data: dict):
+    """Update table capacity or active status."""
+    db = get_db()
+    updates = {}
+    if "capacity" in table_data:
+        updates["capacity"] = int(table_data["capacity"])
+    if "is_active" in table_data:
+        updates["is_active"] = bool(table_data["is_active"])
+    if "table_number" in table_data:
+        updates["table_number"] = str(table_data["table_number"])
+
+    result = db.table("tables_inventory").update(updates).eq("id", table_id).execute()
+    return result.data[0]
+
+
+@app.delete("/api/staff/tables-inventory/{table_id}", dependencies=[Depends(require_staff)])
+async def delete_table(table_id: str):
+    """Remove a table from inventory."""
+    db = get_db()
+    db.table("tables_inventory").delete().eq("id", table_id).execute()
+    return {"detail": "Table removed."}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BOOKINGS
 # ═══════════════════════════════════════════════════════════════════════════════
-
-@app.post("/api/bookings")
-async def create_booking(req: CreateBookingRequest, current_user: dict = Depends(require_customer)):
-    db = get_db()
-    restaurant_id = req.restaurant_id or current_user.get("restaurant_id") or settings.default_restaurant_id
-    user_id = current_user["user_id"]
-
-    booking_time = parse_booking_datetime(req.booking_time)
-    if not booking_time:
-        raise HTTPException(status_code=422, detail="Invalid booking time format. Use ISO 8601.")
-
-    valid, err = validate_booking_time(booking_time)
-    if not valid:
-        raise HTTPException(status_code=422, detail=err)
-
-    # Check for duplicate
-    existing = db.table("bookings").select("*").eq("restaurant_id", restaurant_id).execute()
-    if check_duplicate_booking(existing.data, user_id, booking_time):
-        raise HTTPException(status_code=409, detail="You already have a booking around that time.")
-
-    # Check capacity
-    settings_row = db.table("restaurant_policies").select("table_count, max_party_size").eq("restaurant_id", restaurant_id).execute()
-    table_count = (settings_row.data[0].get("table_count") or 20) if settings_row.data else 20
-    max_party = (settings_row.data[0].get("max_party_size") or 10) if settings_row.data else 10
-
-    ok, cap_err = check_capacity(existing.data, booking_time, req.party_size, table_count, max_party)
-    if not ok:
-        raise HTTPException(status_code=409, detail=cap_err)
-
-    user_row = db.table("user_sessions").select("name").eq("id", user_id).execute()
-    customer_name = user_row.data[0]["name"] if user_row.data else "Guest"
-
-    result = db.table("bookings").insert({
-        "restaurant_id": restaurant_id,
-        "user_id": user_id,
-        "customer_name": customer_name,
-        "party_size": req.party_size,
-        "booking_time": booking_time.isoformat(),
-        "status": "confirmed",
-        "special_requests": req.special_requests,
-    }).execute()
-
-    return result.data[0]
-
 
 @app.get("/api/bookings")
 async def get_customer_bookings(current_user: dict = Depends(require_customer)):
@@ -945,42 +1116,138 @@ async def cancel_booking(booking_id: str, current_user: dict = Depends(require_c
     b = booking.data[0]
     if b["user_id"] != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="Not your booking.")
-
     from datetime import datetime
     bt = datetime.fromisoformat(b["booking_time"])
     ok, err = can_cancel_booking(bt)
     if not ok:
         raise HTTPException(status_code=409, detail=err)
-
     db.table("bookings").update({"status": "cancelled"}).eq("id", booking_id).execute()
     return {"detail": "Booking cancelled."}
 
-
-@app.get("/api/staff/bookings", dependencies=[Depends(require_staff)])
-async def staff_get_bookings(current_user: dict = Depends(require_staff)):
+@app.post("/api/bookings")
+async def create_booking(
+    req: CreateBookingRequest,
+    current_user: dict = Depends(require_customer),
+):
     db = get_db()
-    result = (
-        db.table("bookings")
-        .select("*")
-        .eq("restaurant_id", current_user["restaurant_id"])
-        .order("booking_time")
-        .execute()
-    )
-    return result.data
+    restaurant_id = req.restaurant_id or current_user.get("restaurant_id") or settings.default_restaurant_id
+    user_id = current_user["user_id"]
 
+    booking_time = parse_booking_datetime(req.booking_time)
+    if not booking_time:
+        raise HTTPException(status_code=422, detail="Invalid booking time format. Use ISO 8601.")
 
-@app.put("/api/staff/bookings/{booking_id}/confirm", dependencies=[Depends(require_staff)])
-async def confirm_booking(booking_id: str):
-    db = get_db()
-    db.table("bookings").update({"status": "confirmed"}).eq("id", booking_id).execute()
-    return {"detail": "Booking confirmed."}
+    valid, err = validate_booking_time(booking_time)
+    if not valid:
+        raise HTTPException(status_code=422, detail=err)
 
+    # Check for duplicate
+    existing = db.table("bookings").select("*").eq("restaurant_id", restaurant_id).execute()
+    if check_duplicate_booking(existing.data, user_id, booking_time):
+        raise HTTPException(status_code=409, detail="You already have a booking around that time.")
 
-@app.delete("/api/staff/bookings/{booking_id}", dependencies=[Depends(require_staff)])
-async def staff_cancel_booking(booking_id: str):
-    db = get_db()
-    db.table("bookings").update({"status": "cancelled"}).eq("id", booking_id).execute()
-    return {"detail": "Booking cancelled."}
+    assigned_table_id = None
+    assigned_table_number = None
+
+    # ── Try smart table allocation (only if tables_inventory exists) ──────────
+    try:
+        tables_result = (
+            db.table("tables_inventory")
+            .select("*")
+            .eq("restaurant_id", restaurant_id)
+            .eq("is_active", True)
+            .execute()
+        )
+
+        if tables_result.data:
+            from app.booking_service import (
+                get_tables_booked_in_slot,
+                find_best_table,
+                get_available_slots,
+            )
+
+            booked_ids = get_tables_booked_in_slot(existing.data, booking_time)
+            best_table = find_best_table(tables_result.data, req.party_size, booked_ids)
+
+            if not best_table:
+                available_slots = get_available_slots(
+                    tables_result.data,
+                    existing.data,
+                    req.party_size,
+                    booking_time,
+                )
+                if available_slots:
+                    slots_str = ", ".join(available_slots[:5])
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"No table available for {req.party_size} guests at that time. "
+                            f"Available slots on the same day: {slots_str}"
+                        )
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"No tables available for {req.party_size} guests on that date. "
+                            f"Please try a different date."
+                        )
+                    )
+
+            assigned_table_id = best_table["id"]
+            assigned_table_number = best_table["table_number"]
+            logger.info(
+                f"Assigned table #{assigned_table_number} "
+                f"(capacity {best_table['capacity']}) for party of {req.party_size}"
+            )
+        else:
+            # No table inventory configured — use legacy capacity check
+            raise ValueError("no_inventory")
+
+    except HTTPException:
+        raise  # Re-raise HTTP errors from smart allocation
+    except Exception as e:
+        if "no_inventory" not in str(e):
+            logger.warning(f"Smart table allocation failed, using legacy: {e}")
+        # Legacy fallback
+        settings_row = db.table("restaurant_policies").select(
+            "table_count, max_party_size"
+        ).eq("restaurant_id", restaurant_id).execute()
+        table_count = (settings_row.data[0].get("table_count") or 20) if settings_row.data else 20
+        max_party = (settings_row.data[0].get("max_party_size") or 10) if settings_row.data else 10
+
+        ok, cap_err = check_capacity(existing.data, booking_time, req.party_size, table_count, max_party)
+        if not ok:
+            raise HTTPException(status_code=409, detail=cap_err)
+
+    user_row = db.table("user_sessions").select("name").eq("id", user_id).execute()
+    customer_name = user_row.data[0]["name"] if user_row.data else "Guest"
+
+    insert_data = {
+        "restaurant_id": restaurant_id,
+        "user_id": user_id,
+        "customer_name": customer_name,
+        "party_size": req.party_size,
+        "booking_time": booking_time.isoformat(),
+        "status": "confirmed",
+        "special_requests": req.special_requests,
+    }
+
+    # Only add table assignment fields if they exist in DB
+    if assigned_table_id:
+        try:
+            insert_data["assigned_table_id"] = assigned_table_id
+            insert_data["assigned_table_number"] = assigned_table_number
+        except Exception:
+            pass
+
+    result = db.table("bookings").insert(insert_data).execute()
+    booking = result.data[0]
+
+    if assigned_table_number:
+        booking["message"] = f"Table {assigned_table_number} reserved for {req.party_size} guests."
+
+    return booking
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1157,6 +1424,32 @@ async def request_cancellation(
             f"Request: {cancel_desc}"
         )
     }
+    
+@app.get("/api/staff/bookings", dependencies=[Depends(require_staff)])
+async def staff_get_bookings(current_user: dict = Depends(require_staff)):
+    db = get_db()
+    result = (
+        db.table("bookings")
+        .select("*")
+        .eq("restaurant_id", current_user["restaurant_id"])
+        .order("booking_time")
+        .execute()
+    )
+    return result.data
+
+
+@app.put("/api/staff/bookings/{booking_id}/confirm", dependencies=[Depends(require_staff)])
+async def confirm_booking(booking_id: str):
+    db = get_db()
+    db.table("bookings").update({"status": "confirmed"}).eq("id", booking_id).execute()
+    return {"detail": "Booking confirmed."}
+
+
+@app.delete("/api/staff/bookings/{booking_id}", dependencies=[Depends(require_staff)])
+async def staff_cancel_booking(booking_id: str):
+    db = get_db()
+    db.table("bookings").update({"status": "cancelled"}).eq("id", booking_id).execute()
+    return {"detail": "Booking cancelled."}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CRM
@@ -1165,15 +1458,40 @@ async def request_cancellation(
 @app.get("/api/staff/crm", dependencies=[Depends(require_staff)])
 async def get_crm(current_user: dict = Depends(require_staff)):
     db = get_db()
+    restaurant_id = current_user["restaurant_id"]
+
     result = (
         db.table("user_sessions")
         .select("*")
-        .eq("restaurant_id", current_user["restaurant_id"])
+        .eq("restaurant_id", restaurant_id)
         .order("total_spend", desc=True)
         .execute()
     )
-    return result.data
+    customers = result.data
 
+    # ── Compute restaurant-level ARPU ─────────────────────────────────────────
+    total_revenue = sum(float(c.get("total_spend") or 0) for c in customers)
+    paying_customers = [c for c in customers if float(c.get("total_spend") or 0) > 0]
+    arpu = round(total_revenue / len(paying_customers), 2) if paying_customers else 0
+
+    # ── Compute per-customer ARPU (revenue per visit) ─────────────────────────
+    for c in customers:
+        visits = int(c.get("visit_count") or 0)
+        spend = float(c.get("total_spend") or 0)
+        c["revenue_per_visit"] = round(spend / visits, 2) if visits > 0 else 0
+
+    return {
+        "customers": customers,
+        "summary": {
+            "total_customers": len(customers),
+            "paying_customers": len(paying_customers),
+            "total_revenue": round(total_revenue, 2),
+            "arpu": arpu,  # Average Revenue Per User across restaurant
+            "average_visits": round(
+                sum(int(c.get("visit_count") or 0) for c in customers) / len(customers), 1
+            ) if customers else 0,
+        }
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SETTINGS
@@ -1460,35 +1778,54 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
             logger.warning(f"Auto-order failed: {e}")
 
     # ── Auto-create booking when AI says "I'll book that for you now" ─────
+    # ── Auto-create booking when AI confirms ──────────────────────────────
     reply_lower = result.get("reply", "").lower()
-    logger.info(f"Booking trigger check — mode={result.get('new_mode')} reply='{result.get('reply','')[:100]}'")
-    if result.get("new_mode") == "booking" and any(phrase in reply_lower for phrase in [
-    "i'll book that for you now",
-    "please go to the book tab",
-    "got it! please go to the book",
-    "go to the book tab to confirm",
-    "your reservation for",
-]):
+    logger.info(f"Booking trigger — mode={result.get('new_mode')} reply='{result.get('reply','')[:80]}'")
+
+    booking_trigger_phrases = [
+        "i'll book that for you now",
+        "please go to the book tab",
+        "got it! please go to the book",
+        "go to the book tab to confirm",
+        "your reservation for",
+    ]
+    should_attempt_booking = (
+        result.get("new_mode") == "booking"
+        and any(phrase in reply_lower for phrase in booking_trigger_phrases)
+        and not result.get("booking_placed")        # never try twice in one request
+        and not result.get("booking_error")         # don't retry after an error
+    )
+
+    if should_attempt_booking:
         try:
             import re as _re
-            from datetime import datetime as _dt, timedelta as _td, date as _date
+            from datetime import datetime as _dt, timedelta as _td
             from zoneinfo import ZoneInfo as _ZI
             from app.booking_service import validate_booking_time, check_capacity, check_duplicate_booking
 
             DUBAI_TZ = _ZI("Asia/Dubai")
             now_dubai = _dt.now(DUBAI_TZ)
-            history_text = " ".join([m.get("content", "") for m in req.conversation_history])
-            all_text = (history_text + " " + req.message).lower()
+
+            # ── Parse party size from conversation ────────────────────────
+            # Use only current reply + current message — NOT full history
+            # Full history causes old bookings to bleed into the parser
+            parse_source = result.get("reply", "") + " " + req.message
+            parse_lower = parse_source.lower()
 
             party_size = 2
-            for pat in [r'\bfor\s+(\d+)\b', r'\b(\d+)\s*(?:people|guests|persons|pax)\b']:
-                pm = _re.search(pat, all_text)
+            for pat in [
+                r'\bfor\s+(\d+)\s*(?:people|guests|persons|pax)?\b',
+                r'\b(\d+)\s*(?:people|guests|persons|pax)\b',
+            ]:
+                pm = _re.search(pat, parse_lower)
                 if pm:
                     party_size = int(pm.group(1))
-                    break
+                    if 1 <= party_size <= 20:
+                        break
 
+            # ── Parse time from current reply ─────────────────────────────
             hour, minute = 19, 0
-            tm = _re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b', all_text)
+            tm = _re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b', parse_lower)
             if tm:
                 hour = int(tm.group(1))
                 minute = int(tm.group(2) or 0)
@@ -1497,10 +1834,11 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                 elif tm.group(3) == "am" and hour == 12:
                     hour = 0
 
-            booking_date = (now_dubai + _td(days=1)).date()
+            # ── Parse date ONLY from current AI reply (not history) ───────
+            # This is the critical fix — history contains old dates that bleed in
+            date_source = result.get("reply", "")
+            booking_date = None
 
-            # Parse specific dates first — most reliable source is the AI's reply
-            # which already has the confirmed date ("May 3, 2026", "3rd April" etc.)
             MONTHS = {
                 "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
                 "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
@@ -1513,101 +1851,85 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                 "mon":0,"tue":1,"wed":2,"thu":3,"fri":4,"sat":5,"sun":6,
             }
 
-            # CRITICAL: Use ONLY the AI reply as date source.
-            # all_text includes conversation history which contains old dates
-            # and causes the parser to always resolve to the first booking date.
-            date_source = result.get("reply", "")
+            import datetime as _datetime_mod
 
-            found_date = False
+            def try_date(year, month, day):
+                try:
+                    return _datetime_mod.date(year, month, day)
+                except ValueError:
+                    return None
 
-            # Pattern: "May 3, 2026" or "May 3 2026"
-            m = _re.search(
+            ds = date_source.lower()
+
+            # Pattern 1: "Month Day, Year" or "Month Day Year" e.g. "July 5 2026"
+            matches = _re.findall(
                 r'\b(january|february|march|april|may|june|july|august|september|'
                 r'october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)'
-                r'\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})',
-                date_source.lower()
+                r'\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})\b', ds
             )
-            if m:
-                month = MONTHS[m.group(1)]
-                day = int(m.group(2))
-                year = int(m.group(3))
-                try:
-                    import datetime as _datetime_mod
-                    booking_date = _datetime_mod.date(year, month, day)
-                    found_date = True
-                except ValueError:
-                    # Invalid date like June 31 — tell the customer immediately
-                    result["reply"] = (
-                        f"Sorry, {m.group(1).capitalize()} {day} doesn't exist. "
-                        f"Please choose a valid date and I'll book it for you."
-                    )
-                    return result
+            if matches:
+                # Take the LAST match — AI states the booking date last
+                # e.g. "Today is April 9... I'll book April 11" → take April 11
+                last = matches[-1]
+                d = try_date(int(last[2]), MONTHS[last[0]], int(last[1]))
+                if d:
+                    booking_date = d
 
-            # Pattern: "3 May 2026" or "3rd May 2026"
-            if not found_date:
-                m = _re.search(
+            # Pattern 2: "Day Month Year" e.g. "5 July 2026" or "5th July 2026"
+            if not booking_date:
+                matches2 = _re.findall(
                     r'\b(\d{1,2})(?:st|nd|rd|th)?\s+'
                     r'(january|february|march|april|may|june|july|august|september|'
                     r'october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)'
-                    r'\s*,?\s*(\d{4})',
-                    date_source.lower()
+                    r'\s*,?\s*(\d{4})\b', ds
                 )
-                if m:
-                    day = int(m.group(1))
-                    month = MONTHS[m.group(2)]
-                    year = int(m.group(3))
-                    try:
-                        import datetime as _datetime_mod
-                        booking_date = _datetime_mod.date(year, month, day)
-                        found_date = True
-                    except ValueError:
-                        result["reply"] = (
-                            f"Sorry, {m.group(2).capitalize()} {day} doesn't exist. "
-                            f"Please choose a valid date and I'll book it for you."
-                        )
-                        return result
+                if matches2:
+                    last2 = matches2[-1]
+                    d = try_date(int(last2[2]), MONTHS[last2[1]], int(last2[0]))
+                    if d:
+                        booking_date = d
 
-            # Pattern: "May 3" or "3rd May" (no year — use current or next year)
-            if not found_date:
-                m = _re.search(
+            # Pattern 3: "Month Day" no year — pick nearest future occurrence
+            if not booking_date:
+                matches3 = _re.findall(
                     r'\b(january|february|march|april|may|june|july|august|september|'
                     r'october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)'
-                    r'\s+(\d{1,2})(?:st|nd|rd|th)?',
-                    date_source.lower()
+                    r'\s+(\d{1,2})(?:st|nd|rd|th)?\b', ds
+                )
+                if matches3:
+                    last3 = matches3[-1]
+                    for yr in [now_dubai.year, now_dubai.year + 1]:
+                        d = try_date(yr, MONTHS[last3[0]], int(last3[1]))
+                        if d and d >= now_dubai.date():
+                            booking_date = d
+                            break
+
+            # Pattern 4: "Day Month" no year
+            if not booking_date:
+                m = _re.search(
+                    r'\b(\d{1,2})(?:st|nd|rd|th)?\s+'
+                    r'(january|february|march|april|may|june|july|august|september|'
+                    r'october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b',
+                    ds
                 )
                 if m:
-                    month = MONTHS[m.group(1)]
-                    day = int(m.group(2))
                     for yr in [now_dubai.year, now_dubai.year + 1]:
-                        try:
-                            import datetime as _datetime_mod
-                            candidate = _datetime_mod.date(yr, month, day)
-                            if candidate >= now_dubai.date():
-                                booking_date = candidate
-                                found_date = True
-                                break
-                        except ValueError:
-                            if yr == now_dubai.year + 1:
-                                # Tried both years and both failed — truly invalid date
-                                result["reply"] = (
-                                    f"Sorry, that date doesn't exist. "
-                                    f"Please choose a valid date and I'll book it for you."
-                                )
-                                return result
-                            continue
+                        d = try_date(yr, MONTHS[m.group(2)], int(m.group(1)))
+                        if d and d >= now_dubai.date():
+                            booking_date = d
+                            break
 
-            # Fallbacks
-            if not found_date:
-                if "today" in all_text:
+            # Pattern 5: relative keywords — only from user message not AI reply
+            user_msg_lower = req.message.lower()
+            if not booking_date:
+                if "today" in user_msg_lower:
                     booking_date = now_dubai.date()
-                elif "tomorrow" in all_text:
+                elif "tomorrow" in user_msg_lower:
                     booking_date = (now_dubai + _td(days=1)).date()
                 else:
-                    # Weekday names
                     wm = _re.search(
                         r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
-                        r'mon|tue|wed|thu|fri|sat|sun)\b',
-                        all_text
+                        r'mon|tue|wed|thu|fri|sat|sun)\b', user_msg_lower
                     )
                     if wm:
                         twd = WEEKDAYS[wm.group(1)]
@@ -1615,82 +1937,103 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                         days_ahead = (twd - cwd) % 7 or 7
                         booking_date = (now_dubai + _td(days=days_ahead)).date()
 
-            if not found_date and "tomorrow" not in all_text and "today" not in all_text:
-                # No date found and no fallback keywords — can't make a booking
-                result["reply"] = (
-                    "I couldn't determine the date for your booking. "
-                    "Please specify a date like 'June 15' or 'next Friday'."
+            if not booking_date:
+                logger.warning("Could not parse booking date from AI reply")
+                result["reply"] += (
+                    "\n\n⚠️ I couldn't determine the date. "
+                    "Please use the Book tab to confirm your reservation."
                 )
+                result["booking_error"] = True
                 return result
-            
-            logger.info(f"Booking date resolved: {booking_date} (found_date={found_date})")
+
+            logger.info(f"Booking date resolved: {booking_date} hour={hour} min={minute}")
 
             booking_dt = _dt(
                 booking_date.year, booking_date.month, booking_date.day,
                 hour, minute, 0, tzinfo=DUBAI_TZ
             )
 
-            logger.info(f"Booking attempt: {party_size} people on {booking_dt.isoformat()}")
-
+            # ── Validate time ─────────────────────────────────────────────
             valid, err = validate_booking_time(booking_dt)
             if not valid:
-                # Past date, too soon, or beyond 3-month limit
                 result["reply"] = (
                     f"Sorry, I couldn't confirm that booking — {err}\n\n"
                     f"Please choose a different date and I'll book it for you."
                 )
                 result["booking_placed"] = False
+                result["booking_error"] = True
+                return result
+
+            # ── Fetch existing bookings for this user only ────────────────
+            user_bookings = db.table("bookings").select("*").eq(
+                "restaurant_id", restaurant_id
+            ).eq("user_id", user_id).execute()
+
+            # ── Duplicate check: same user, ±2hr window, active only ──────
+            is_dup = check_duplicate_booking(user_bookings.data, user_id, booking_dt)
+            logger.info(f"Duplicate check: is_dup={is_dup} for {booking_dt.isoformat()}")
+
+            if is_dup:
+                result["reply"] = (
+                    f"You already have a booking close to that time. "
+                    f"Please choose a time at least 2 hours apart from your existing booking, "
+                    f"or cancel it from the Book tab first."
+                )
+                result["booking_placed"] = False
+                result["booking_error"] = True
+                return result
+
+            # ── Capacity check across all restaurant bookings ─────────────
+            all_bookings = db.table("bookings").select("*").eq(
+                "restaurant_id", restaurant_id
+            ).execute()
+
+            pol = db.table("restaurant_policies").select(
+                "table_count, max_party_size"
+            ).eq("restaurant_id", restaurant_id).execute()
+            tc = (pol.data[0].get("table_count") or 20) if pol.data else 20
+            mp = (pol.data[0].get("max_party_size") or 10) if pol.data else 10
+
+            cap_ok, cap_err = check_capacity(all_bookings.data, booking_dt, party_size, tc, mp)
+            if not cap_ok:
+                result["reply"] = (
+                    f"Sorry, no tables available at that time — {cap_err}\n\n"
+                    f"Please choose a different time."
+                )
+                result["booking_placed"] = False
+                result["booking_error"] = True
+                return result
+
+            # ── Create the booking ────────────────────────────────────────
+            bk = db.table("bookings").insert({
+                "restaurant_id": restaurant_id,
+                "user_id": user_id,
+                "customer_name": customer_name,
+                "party_size": party_size,
+                "booking_time": booking_dt.isoformat(),
+                "status": "confirmed",
+            }).execute()
+
+            if bk.data:
+                # Format date/time from the actual booking_dt — single source of truth
+                time_str = booking_dt.strftime("%-I:%M %p") if hasattr(booking_dt, 'strftime') else booking_dt.strftime("%I:%M %p").lstrip("0")
+                date_str = booking_dt.strftime("%A %d %B %Y")
+                summary = f"{party_size} people · {date_str} · {time_str}"
+                result["booking_placed"] = True
+                result["booking_id"] = bk.data[0]["id"]
+                result["booking_summary"] = summary
+                # Include ISO string so frontend can format it correctly
+                result["booking_datetime_iso"] = booking_dt.isoformat()
+                logger.info(f"Booking created: {booking_dt.isoformat()} for {party_size} people")
             else:
-                existing_bk = db.table("bookings").select("*").eq(
-                    "restaurant_id", restaurant_id
-                ).execute()
+                result["reply"] += "\n\n⚠️ Booking could not be saved. Please use the Book tab."
+                result["booking_error"] = True
 
-                is_dup = check_duplicate_booking(existing_bk.data, user_id, booking_dt)
-                logger.info(f"Duplicate check: is_dup={is_dup} for {booking_dt.isoformat()}")
-
-                if is_dup:
-                    result["reply"] = (
-                        f"You already have a booking around that time. "
-                        f"Please choose a different date or time, or cancel your existing booking from the Book tab first."
-                    )
-                    result["booking_placed"] = False
-                else:
-                    pol = db.table("restaurant_policies").select(
-                        "table_count, max_party_size"
-                    ).eq("restaurant_id", restaurant_id).execute()
-                    tc = (pol.data[0].get("table_count") or 20) if pol.data else 20
-                    mp = (pol.data[0].get("max_party_size") or 10) if pol.data else 10
-                    cap_ok, cap_err = check_capacity(existing_bk.data, booking_dt, party_size, tc, mp)
-
-                    if not cap_ok:
-                        result["reply"] = (
-                            f"Sorry, no tables are available at that time — {cap_err}\n\n"
-                            f"Please choose a different time and I'll book it for you."
-                        )
-                        result["booking_placed"] = False
-                    else:
-                        bk = db.table("bookings").insert({
-                            "restaurant_id": restaurant_id,
-                            "user_id": user_id,
-                            "customer_name": customer_name,
-                            "party_size": party_size,
-                            "booking_time": booking_dt.isoformat(),
-                            "status": "confirmed",
-                        }).execute()
-                        if bk.data:
-                            time_str = booking_dt.strftime("%I:%M %p").lstrip("0")
-                            date_str = booking_dt.strftime("%A %d %B %Y")
-                            result["booking_placed"] = True
-                            result["booking_id"] = bk.data[0]["id"]
-                            result["booking_summary"] = f"{party_size} people · {date_str} · {time_str}"
-                            logger.info(f"Booking created: {booking_dt.isoformat()} for {party_size} people")
-                        else:
-                            result["reply"] += "\n\n⚠️ Booking could not be saved. Please use the Book tab to confirm."
         except Exception as e:
             logger.error(f"Auto-booking failed: {e}", exc_info=True)
+            result["booking_error"] = True
 
     return result
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # QR CODE GENERATION
