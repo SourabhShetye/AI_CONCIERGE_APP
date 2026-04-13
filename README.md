@@ -237,7 +237,7 @@ restaurant-app/
 
 Built as a complete ground-up rebuild of a Telegram-based restaurant bot prototype, demonstrating full-stack AI engineering with production-grade architecture.
 
-[![GitHub](https://img.shields.io/badge/GitHub-@yourusername-181717?style=flat&logo=github)](https://github.com/SourabhShetye)
+[![GitHub](https://img.shields.io/badge/GitHub-SourabhShetye-181717?style=flat&logo=github)](https://github.com/SourabhShetye)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5?style=flat&logo=linkedin)](https://www.linkedin.com/in/sourabh-shetye-36b9282b4)
 
 ---
