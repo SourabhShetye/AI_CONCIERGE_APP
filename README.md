@@ -4,11 +4,11 @@
 
 <div align="center">
 
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-Visit%20App-6366f1?style=for-the-badge)](https://ai-concierge-app-frontend.vercel.app)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Visit%20App-6366f1?style=for-the-badge)](https://ai-concierge-app-frontend-git-fe-ceb024-sourabhshetyes-projects.vercel.app/)
 [![Backend API](https://img.shields.io/badge/Backend%20API-Render-22c55e?style=for-the-badge)](https://ai-concierge-app-backend.onrender.com)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
-**[Customer Portal](https://ai-concierge-app-frontend.vercel.app/customer/login) · [Staff Portal](https://ai-concierge-app-frontend.vercel.app/staff/login) · [API Docs](https://ai-concierge-app-backend.onrender.com/docs)**
+**[Customer Portal](https://ai-concierge-app-frontend-git-fe-ceb024-sourabhshetyes-projects.vercel.app/customer/login) · [Staff Portal](https://ai-concierge-app-frontend-git-fe-ceb024-sourabhshetyes-projects.vercel.app/staff/login) · [API Docs](https://ai-concierge-app-backend.onrender.com/docs)**
 
 </div>
 
@@ -183,7 +183,7 @@ restaurant-app/
 
 ## 🔐 Demo Credentials
 
-> **Live Demo:** [your-app.vercel.app]([https://your-app.vercel.app](https://ai-concierge-app-frontend.vercel.app/)
+> **Live Demo:** [your-app.vercel.app]([https://your-app.vercel.app](https://ai-concierge-app-frontend-git-fe-ceb024-sourabhshetyes-projects.vercel.app)
 
 | Portal | Credentials |
 |--------|-------------|
