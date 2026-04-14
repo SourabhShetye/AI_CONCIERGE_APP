@@ -80,6 +80,8 @@ export interface Booking {
   status: BookingStatus
   special_requests?: string
   created_at: string
+  assigned_table_id?: string     
+  assigned_table_number?: string
 }
 
 // ─── CRM ──────────────────────────────────────────────────────────────────────
