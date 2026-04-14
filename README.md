@@ -4,29 +4,19 @@
 
 <div align="center">
 
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-Visit%20App-6366f1?style=for-the-badge)](https://ai-concierge-app-frontend.vercel.app)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Visit%20App-6366f1?style=for-the-badge)](https://ai-concierge-app-frontend-git-fe-ceb024-sourabhshetyes-projects.vercel.app/)
 [![Backend API](https://img.shields.io/badge/Backend%20API-Render-22c55e?style=for-the-badge)](https://ai-concierge-app-backend.onrender.com)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
-**[Customer Portal](https://ai-concierge-app-frontend.vercel.app/customer/login) · [Staff Portal](https://ai-concierge-app-frontend.vercel.app/staff/login) · [API Docs](https://ai-concierge-app-backend.onrender.com/docs)**
+**[Customer Portal](https://ai-concierge-app-frontend-git-fe-ceb024-sourabhshetyes-projects.vercel.app/customer/login) · [Staff Portal](https://ai-concierge-app-frontend-git-fe-ceb024-sourabhshetyes-projects.vercel.app/staff/login) · [API Docs](https://ai-concierge-app-backend.onrender.com/docs)**
 
 </div>
 
 ---
 
-## 📸 Screenshots
-
-> *Customer ordering via AI chat · Staff kitchen display · CRM dashboard*
-
-| Customer Chat | Kitchen Display | CRM Dashboard |
-|:---:|:---:|:---:|
-| AI-powered ordering | Real-time order queue | Customer insights + ARPU |
-
----
-
 ## 🎯 What This Is
 
-A **full-stack SaaS restaurant platform** supporting multiple restaurants from a single deployment. Customers scan a QR code unique to their table, order food in natural language (text or voice), track their order in real time, and pay — all without staff involvement until the food is ready. Staff get a live kitchen display, smart billing, booking management, and an AI operations assistant.
+A **full-stack SaaS restaurant platform** supporting multiple restaurants from a single deployment. Customers scan a QR code unique to their table, order food in natural language, track their order in real time, and pay — all without staff involvement until the food is ready. Staff get a live kitchen display, smart billing, booking management, and an AI operations assistant.
 
 **This is not a prototype.** It handles concurrent multi-tenant data isolation, deterministic AI conversation flows, real-time WebSocket broadcasting, and production-grade authentication.
 
@@ -160,46 +150,6 @@ best_table = available[0]  # Assigns 4-seat, not 6 or 8
 
 ---
 
-## 🚀 Quick Start
-
-### Prerequisites
-- Python 3.11+, Node.js 18+
-- Supabase account (free tier)
-- Groq API key (free tier — [console.groq.com](https://console.groq.com))
-
-### 1. Clone & Setup
-```bash
-git clone https://github.com/yourusername/restaurant-ai-concierge
-cd restaurant-ai-concierge/restaurant-app
-```
-
-### 2. Backend
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env
-# Fill in: SUPABASE_URL, SUPABASE_SERVICE_KEY, GROQ_API_KEY, JWT_SECRET, DEFAULT_RESTAURANT_ID
-uvicorn app.main:app --reload --port 8000
-```
-
-### 3. Frontend
-```bash
-cd frontend
-npm install
-cp .env.example .env
-# Fill in: VITE_API_URL, VITE_WS_URL, VITE_RESTAURANT_ID
-npm run dev
-```
-
-### 4. Database
-Run the SQL schema from `docs/SETUP.md` in your Supabase SQL Editor. Takes ~2 minutes.
-
-**API docs available at:** `http://localhost:8000/docs`
-
----
-
 ## 📁 Project Structure
 
 ```
@@ -233,16 +183,16 @@ restaurant-app/
 
 ## 🔐 Demo Credentials
 
-> **Live Demo:** [your-app.vercel.app](https://your-app.vercel.app)
+> **Live Demo:** [your-app.vercel.app]([https://your-app.vercel.app](https://ai-concierge-app-frontend-git-fe-ceb024-sourabhshetyes-projects.vercel.app)
 
 | Portal | Credentials |
 |--------|-------------|
 | Customer | Register with any name + 4-digit PIN at the login page |
-| Staff (Admin) | Username: `admin` · Password: `[ask me]` |
-| Staff (Chef) | Username: `chef` · Password: `[ask me]` |
+| Staff (Admin) | Username: `admin` · Password: `12345` |
 
 **Test restaurants available:**
-- 🍔 The Tech Bistro — default restaurant
+- My Restaurant - Default Option
+- 🍔 The Tech Bistro 
 - 🌯 Cloud Kitchen Dubai
 - 🏙️ The Rooftop Grill
 
@@ -263,7 +213,7 @@ restaurant-app/
 
 ## 📊 Performance Characteristics
 
-- **Order placement** (voice → kitchen notification): ~3-5 seconds
+- **Order placement** (chatbot → kitchen notification): ~1-3 seconds
 - **WebSocket latency** (order ready → customer notification): <100ms
 - **Concurrent users**: Tested with 3 restaurants, multiple tables simultaneously
 - **AI response time**: ~800ms-1.5s (Groq LPU inference)
@@ -283,11 +233,11 @@ restaurant-app/
 
 ## 👨‍💻 Author
 
-**Sourabh** — Final Year CS Student
+**Sourabh Shetye** — Final Year CS Student
 
-Built as a complete ground-up rebuild of a Telegram-based restaurant bot, demonstrating full-stack AI engineering with production-grade architecture.
+Built as a complete ground-up rebuild of a Telegram-based restaurant bot prototype, demonstrating full-stack AI engineering with production-grade architecture.
 
-[![GitHub](https://img.shields.io/badge/GitHub-@yourusername-181717?style=flat&logo=github)](https://github.com/SourabhShetye)
+[![GitHub](https://img.shields.io/badge/GitHub-SourabhShetye-181717?style=flat&logo=github)](https://github.com/SourabhShetye)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5?style=flat&logo=linkedin)](https://www.linkedin.com/in/sourabh-shetye-36b9282b4)
 
 ---
