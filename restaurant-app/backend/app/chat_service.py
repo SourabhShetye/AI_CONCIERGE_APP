@@ -206,8 +206,8 @@ async def process_chat(
     }
 
     # ── Step 1: Detect new allergens in message ───────────────────────────
-    from app.order_service import detect_allergens_in_text
-    newly_mentioned = detect_allergens_in_text(message)
+    from app.order_service import detect_allergy_declarations
+    newly_mentioned = detect_allergy_declarations(message)
     if newly_mentioned:
         customer_allergies = list(set(customer_allergies + newly_mentioned))
         result["detected_allergies"] = newly_mentioned
@@ -729,13 +729,36 @@ RULES:
     client = Groq(api_key=settings.groq_api_key)
     messages = conversation_history[-6:] + [{"role": "user", "content": message}]
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "system", "content": system}] + messages,
-        temperature=0.3,
-        max_tokens=300,
-    )
-    reply = response.choices[0].message.content or "Sorry, I didn't catch that. Could you rephrase?"
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": system}] + messages,
+            temperature=0.3,
+            max_tokens=300,
+        )
+        reply = response.choices[0].message.content or "Sorry, I didn't catch that. Could you rephrase?"
+    except Exception as groq_error:
+        logger.error(f"Groq API unavailable: {groq_error}")
+        # Graceful fallback — do not crash the chat session
+        if new_mode == ChatMode.ordering:
+            reply = (
+                "Our AI ordering assistant is temporarily unavailable. "
+                "Please browse the menu and add items using the + buttons, "
+                "or ask a staff member for assistance."
+            )
+        elif new_mode == ChatMode.booking:
+            reply = (
+                "Our booking assistant is temporarily unavailable. "
+                "Please use the **Book** tab to make a reservation directly."
+            )
+        else:
+            reply = (
+                "Our AI assistant is temporarily unavailable. "
+                "Please use the menu tabs to order, or speak with a staff member."
+            )
+        result["reply"] = reply
+        result["groq_unavailable"] = True
+        return result
 
     result["reply"] = reply
     return result

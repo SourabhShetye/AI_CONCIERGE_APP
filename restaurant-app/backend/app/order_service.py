@@ -36,23 +36,66 @@ def get_groq() -> Groq:
 # ─── Allergy detection ────────────────────────────────────────────────────────
 
 ALLERGEN_PATTERNS = {
-    "gluten":   r"\b(gluten|wheat|bread|flour|pasta|noodle|bun|wrap|roti|pita)\b",
-    "dairy":    r"\b(milk|cheese|butter|cream|dairy|lactose|yogurt|ghee)\b",
-    "nuts":     r"\b(nut|peanut|almond|cashew|walnut|pistachio|hazelnut)\b",
-    "shellfish":r"\b(shrimp|prawn|crab|lobster|shellfish|scallop|mussel)\b",
-    "eggs":     r"\b(egg|eggs|omelette|frittata)\b",
-    "soy":      r"\b(soy|tofu|edamame|tempeh|miso)\b",
+    "gluten":   r"\b(gluten|wheat|bread|flour|pasta|noodle|bun|wrap|roti|pita|cereal)\b",
+    "dairy":    r"\b(milk|cheese|butter|cream|dairy|lactose|yogurt|ghee|whey|casein)\b",
+    "nuts":     r"\b(nut|peanut|almond|cashew|walnut|pistachio|hazelnut|pecan|tree nut)\b",
+    "shellfish":r"\b(shrimp|prawn|crab|lobster|shellfish|scallop|mussel|oyster|clam)\b",
+    "eggs":     r"\b(egg|eggs|omelette|frittata|mayonnaise|mayo)\b",
+    "soy":      r"\b(soy|tofu|edamame|tempeh|miso|soybean)\b",
+    "fish":     r"\b(salmon|tuna|cod|bass|seabass|fish|anchovy|sardine|tilapia)\b",
+    "sesame":   r"\b(sesame|tahini|hummus)\b",
 }
+
+# ── Natural language allergy declaration patterns ──────────────────────────
+# These detect how customers DESCRIBE their allergies/dietary needs in chat.
+# Distinct from ALLERGEN_PATTERNS which scans menu item names/descriptions.
+ALLERGY_DECLARATION_PATTERNS = [
+    (r"allerg(?:ic|y|ies)\s+to\s+([\w\s,]+)",                "direct_allergy"),
+    (r"have\s+(?:a\s+)?(?:severe\s+)?(\w+)\s+allerg",        "has_allergy"),
+    (r"can(?:\'t|not)\s+(?:eat|have|consume)\s+([\w\s,]+)",  "cannot_eat"),
+    (r"(?:please\s+)?avoid\s+([\w\s,]+)",                    "avoid"),
+    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?vegan",                 "vegan"),
+    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?vegetarian",            "vegetarian"),
+    (r"\bvegetarian\b",                                       "vegetarian"),
+    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?lactose[- ]intolerant", "lactose_intolerant"),
+    (r"lactose[- ]intolerant",                                "lactose_intolerant"),
+    (r"(?:gluten[- ]free|no\s+gluten)",                      "gluten_free"),
+    (r"(?:nut[- ]free|no\s+nuts?|peanut[- ]free|no\s+peanuts?)", "nut_free"),
+    (r"(?:dairy[- ]free|no\s+dairy|avoid\s+dairy)",          "dairy_free"),
+    (r"(?:no\s+(?:shellfish|shrimp|prawns?|lobster|crab))",  "shellfish_free"),
+    (r"kosher",                                               "kosher"),
+    (r"halal",                                                "halal"),
+]
 
 
 def detect_allergens_in_text(text: str) -> list[str]:
-    """Scan menu item description/name for known allergens."""
+    """
+    Scan menu item NAME or DESCRIPTION for allergen ingredients.
+    Used when checking if a dish contains an allergen.
+    e.g. "Grilled Seabass with butter sauce" → ["fish", "dairy"]
+    """
     text_lower = text.lower()
     found = []
     for allergen, pattern in ALLERGEN_PATTERNS.items():
         if re.search(pattern, text_lower):
             found.append(allergen)
     return found
+
+
+def detect_allergy_declarations(message: str) -> list[str]:
+    """
+    Detect how a CUSTOMER declares their allergies in natural language chat.
+    Used when a customer says things like:
+      "I have a nut allergy", "I'm vegan", "please avoid dairy"
+    Returns list of detected dietary tags.
+    Distinct from detect_allergens_in_text() which scans menu item text.
+    """
+    msg_lower = message.lower()
+    detected = []
+    for pattern, tag in ALLERGY_DECLARATION_PATTERNS:
+        if re.search(pattern, msg_lower):
+            detected.append(tag)
+    return list(set(detected))
 
 
 def check_allergy_warnings(
@@ -222,18 +265,63 @@ Return ONLY this JSON format, no other text:
     sold_out_items: list[str] = []
 
     for ai_item in parsed.get("items", []):
-        name_lower = ai_item.get("name", "").lower()
+        ai_name = ai_item.get("name", "").strip()
+        name_lower = ai_name.lower()
+
+        # Guard: skip empty or suspiciously short item names from AI
+        if len(name_lower) < 2:
+            continue
+
         # Find best match in menu
         menu_entry = menu_names_lower.get(name_lower)
+
         if not menu_entry:
-            # Try partial match
+            # Try partial match: AI name contained in menu key or vice versa
             for key, entry in menu_names_lower.items():
                 if name_lower in key or key in name_lower:
                     menu_entry = entry
                     break
 
         if not menu_entry:
-            parsed.setdefault("unrecognized_items", []).append(ai_item.get("name"))
+            # Try word overlap match (≥2 significant words in common)
+            ai_words = set(w for w in name_lower.split() if len(w) > 3)
+            best_overlap, best_entry = 0, None
+            for key, entry in menu_names_lower.items():
+                key_words = set(w for w in key.split() if len(w) > 3)
+                overlap = len(ai_words & key_words)
+                if overlap > best_overlap:
+                    best_overlap, best_entry = overlap, entry
+            if best_overlap >= 2:
+                menu_entry = best_entry
+
+        if not menu_entry:
+            # Try edit-distance typo tolerance (≤2 edits on words ≥4 chars)
+            def _edit_dist(a: str, b: str) -> int:
+                if len(a) < len(b): a, b = b, a
+                if not b: return len(a)
+                prev = list(range(len(b) + 1))
+                for ca in a:
+                    curr = [prev[0] + 1]
+                    for j, cb in enumerate(b):
+                        curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(0 if ca==cb else 1)))
+                    prev = curr
+                return prev[-1]
+
+            for key, entry in menu_names_lower.items():
+                for ai_word in name_lower.split():
+                    if len(ai_word) < 4:
+                        continue
+                    for menu_word in key.split():
+                        if len(menu_word) >= 4 and _edit_dist(ai_word, menu_word) <= 2:
+                            menu_entry = entry
+                            break
+                    if menu_entry:
+                        break
+                if menu_entry:
+                    break
+
+        if not menu_entry:
+            parsed.setdefault("unrecognized_items", []).append(ai_name)
             continue
 
         if menu_entry.get("sold_out"):
