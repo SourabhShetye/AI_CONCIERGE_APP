@@ -1,6 +1,7 @@
 /**
  * websocket.ts - WebSocket connection helpers.
  * Handles reconnection with exponential backoff.
+ * SECURITY: JWT token passed as query param on connection.
  */
 
 import type { WSEvent } from '@/types'
@@ -17,13 +18,16 @@ class WSClient {
   private url = ''
 
   connect(url: string) {
-    this.url = url
+    this.url = url.split('?')[0]
     this.shouldReconnect = true
     this._open()
   }
 
   private _open() {
-    this.ws = new WebSocket(this.url)
+    // Re-read token on every open attempt (handles token refresh between reconnects)
+    const freshToken = sessionStorage.getItem('token') || ''
+    const urlWithToken = this.url.split('?')[0] + `?token=${encodeURIComponent(freshToken)}`
+    this.ws = new WebSocket(urlWithToken)
 
     this.ws.onopen = () => {
       console.log('WS connected:', this.url)
@@ -64,14 +68,18 @@ class WSClient {
   }
 }
 
+// ── SECURITY FIX: Both factory functions now read token from sessionStorage
+// and append it as ?token= query param so the backend can verify identity
+// before accepting the WebSocket connection.
+
 export function createCustomerWS(userId: string): WSClient {
   const client = new WSClient()
-  client.connect(`${WS_URL}/ws/customer/${userId}`)
+  client.connect(`${WS_URL}/ws/customer/${userId}`)  // no token here
   return client
 }
 
 export function createKitchenWS(restaurantId: string): WSClient {
   const client = new WSClient()
-  client.connect(`${WS_URL}/ws/kitchen/${restaurantId}`)
+  client.connect(`${WS_URL}/ws/kitchen/${restaurantId}`)  // no token here
   return client
 }

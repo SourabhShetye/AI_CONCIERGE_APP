@@ -3,6 +3,7 @@ main.py - FastAPI application entry point.
 
 Includes:
   - CORS middleware
+  - Security headers middleware
   - All REST API routes (customer + staff)
   - WebSocket endpoints (customer updates + kitchen display)
   - Startup initialisation
@@ -13,7 +14,7 @@ import logging
 import qrcode
 import io
 from fastapi.responses import StreamingResponse, HTMLResponse
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, Request
 from app.chat_service import process_chat
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -25,8 +26,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import init_db, get_db
 from app.auth import (
-    hash_password, verify_password, create_access_token,
+    hash_password, verify_password, create_access_token, decode_token,
     get_current_user, require_staff, require_admin, require_customer,
+    create_token_pair, rotate_refresh_token, revoke_all_tokens,
+    check_account_lockout, record_failed_login, record_successful_login,
+)
+from app.security_middleware import (
+    SecurityHeadersMiddleware,
+    rate_limiter,
+    sanitise_user_input,
+    sanitise_admin_context,
+    security_tracker,
+    audit_log,
 )
 from pydantic import BaseModel
 from app.models import (
@@ -48,13 +59,33 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Restaurant AI Concierge API", version="2.0.0")
+
+
 async def get_next_order_number(db, restaurant_id: str) -> int:
     """
     Returns the next daily order number for a restaurant.
-    Resets to 1 each day. e.g. Order #1, #2, #3 ... resets next day.
+    Resets at midnight DUBAI time (not UTC) so kitchen order #1 matches
+    the actual start of the restaurant's business day.
     """
-    today = _date.today().isoformat()
+    from zoneinfo import ZoneInfo
+    from datetime import datetime as _dt
+    today = _dt.now(ZoneInfo("Asia/Dubai")).date().isoformat()
     try:
+        # Atomic increment using PostgreSQL RPC — no race condition possible
+        result = db.rpc("increment_order_number", {
+            "p_restaurant_id": restaurant_id,
+            "p_date": today,
+        }).execute()
+
+        if result.data is not None:
+            # Supabase RPC returns scalar as int directly, or wrapped in list
+            val = result.data
+            if isinstance(val, list):
+                val = val[0]
+            if isinstance(val, int) and val > 0:
+                return val
+        # Fallback if RPC not available — use non-atomic method with warning
+        logger.warning("increment_order_number RPC not found, using non-atomic fallback")
         existing = db.table("order_number_sequences").select("*").eq(
             "restaurant_id", restaurant_id
         ).eq("date", today).execute()
@@ -71,20 +102,24 @@ async def get_next_order_number(db, restaurant_id: str) -> int:
                 "date": today,
                 "last_number": 1,
             }).execute()
-
         return new_number
     except Exception as e:
         logger.error(f"Order number generation failed: {e}")
         return 0  # fallback — 0 means unassigned
 
-# ─── CORS ─────────────────────────────────────────────────────────────────────
+
+# ─── Security headers + CORS ──────────────────────────────────────────────────
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.origins_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    expose_headers=["X-Request-ID"],
+    max_age=600,
 )
 
 
@@ -106,10 +141,11 @@ async def health():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/customer/register", response_model=TokenResponse)
-async def customer_register(req: CustomerRegisterRequest):
+async def customer_register(req: CustomerRegisterRequest, request: Request):
+    rate_limiter.check(request, limit=3, window_seconds=300, scope="register")
     db = get_db()
     restaurant_id = req.restaurant_id or settings.default_restaurant_id
-    logger.info(f"Customer login: name={req.name} restaurant_id={restaurant_id}")
+    logger.info(f"Customer register: name={req.name} restaurant_id={restaurant_id}")
 
     # Check if customer already exists (same name + restaurant)
     existing = (
@@ -122,7 +158,33 @@ async def customer_register(req: CustomerRegisterRequest):
     if existing.data:
         raise HTTPException(status_code=409, detail="Name already registered. Please log in.")
 
+    # GDPR Article 9 — only store allergies with explicit consent
+    allergies_to_store = []
+    consent_timestamp = None
+    if req.allergies and getattr(req, "health_data_consent", False):
+        allergies_to_store = req.allergies
+        consent_timestamp = datetime.now(timezone.utc).isoformat()
+    elif req.allergies and not getattr(req, "health_data_consent", False):
+        logger.info(
+            f"GDPR: User provided allergy data without health_data_consent — not stored."
+        )
+
     pin_hash = hash_password(req.pin)
+
+    # Check table occupancy before allowing registration with that table
+    if req.table_number:
+        active_at_table = db.table("orders").select("user_id").eq(
+            "restaurant_id", restaurant_id
+        ).eq("table_number", req.table_number).in_(
+            "status", ["pending", "preparing", "ready"]
+        ).execute()
+
+        if active_at_table.data:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Table {req.table_number} is currently occupied. Please check your table number or ask a staff member."
+            )
+
     result = (
         db.table("user_sessions")
         .insert({
@@ -130,37 +192,46 @@ async def customer_register(req: CustomerRegisterRequest):
             "name": req.name,
             "phone": req.phone,
             "pin_hash": pin_hash,
-            "allergies": req.allergies or [],
+            "allergies": allergies_to_store,
             "visit_count": 0,
             "total_spend": 0.0,
             "tags": [],
             "table_number": req.table_number,
+            "health_data_consent": getattr(req, "health_data_consent", False),
+            "health_data_consent_timestamp": consent_timestamp,
+            "terms_accepted_timestamp": datetime.now(timezone.utc).isoformat(),
         })
         .execute()
     )
     user = result.data[0]
 
-    token = create_access_token({
-        "user_id": user["id"],
-        "role": "customer",
-        "restaurant_id": user["restaurant_id"],  # from DB record
-        "name": req.name,
-    })
-    return TokenResponse(
-        access_token=token,
-        role="customer",
+    access_token, refresh_token = await create_token_pair(
+        db,
         user_id=user["id"],
+        role="customer",
+        restaurant_id=user["restaurant_id"],
         name=req.name,
-        visit_count=0,
-        total_spend=0.0,
-        tags=[],
     )
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "role": "customer",
+        "user_id": user["id"],
+        "name": req.name,
+        "visit_count": 0,
+        "total_spend": 0.0,
+        "tags": [],
+    }
 
 
 @app.post("/api/customer/login", response_model=TokenResponse)
-async def customer_login(req: CustomerLoginRequest):
+async def customer_login(req: CustomerLoginRequest, request: Request):
+    rate_limiter.check(request, limit=5, window_seconds=60, scope="customer_login")
     db = get_db()
     restaurant_id = req.restaurant_id or settings.default_restaurant_id
+
+    await check_account_lockout(db, req.name, restaurant_id)
 
     result = (
         db.table("user_sessions")
@@ -170,34 +241,144 @@ async def customer_login(req: CustomerLoginRequest):
         .execute()
     )
     if not result.data:
-        raise HTTPException(status_code=401, detail="Customer not found. Please register first.")
+        await record_failed_login(db, req.name, restaurant_id)
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
 
     user = result.data[0]
     if not verify_password(req.pin, user["pin_hash"]):
-        raise HTTPException(status_code=401, detail="Incorrect PIN.")
+        await record_failed_login(db, req.name, restaurant_id)
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
 
-    # Update table number if provided
+    await record_successful_login(db, req.name, restaurant_id)
+
     if req.table_number:
-        db.table("user_sessions").update({"table_number": req.table_number}).eq("id", user["id"]).execute()
+        # Check if another active customer is already seated at this table
+        active_at_table = db.table("orders").select("user_id").eq(
+            "restaurant_id", restaurant_id
+        ).eq("table_number", req.table_number).in_(
+            "status", ["pending", "preparing", "ready"]
+        ).execute()
+
+        other_users = [
+            o["user_id"] for o in (active_at_table.data or [])
+            if o["user_id"] != user["id"]
+        ]
+
+        if other_users:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Table {req.table_number} is currently occupied. Please ask a staff member to confirm your table number."
+            )
+
+        db.table("user_sessions").update({"table_number": req.table_number}).eq(
+            "id", user["id"]
+        ).execute()
 
     welcome = build_welcome_message(req.name, user.get("visit_count", 0), user.get("tags", []))
-    # Always use restaurant_id from the DB record — never trust the request
-    token = create_access_token({
-        "user_id": user["id"],
-        "role": "customer",
-        "restaurant_id": user["restaurant_id"],  # from DB, guaranteed correct
-        "name": req.name,
-        "welcome": welcome,
-    })
-    return TokenResponse(
-        access_token=token,
-        role="customer",
+
+    access_token, refresh_token = await create_token_pair(
+        db,
         user_id=user["id"],
+        role="customer",
+        restaurant_id=user["restaurant_id"],
         name=req.name,
-        visit_count=user.get("visit_count", 0),
-        total_spend=float(user.get("total_spend", 0)),
-        tags=user.get("tags", []),
     )
+
+    await audit_log(
+        db,
+        actor_id=user["id"],
+        actor_role="customer",
+        action="LOGIN",
+        resource_type="user_session",
+        resource_id=user["id"],
+        restaurant_id=user["restaurant_id"],
+        ip_address=request.client.host if request.client else "",
+        outcome="success",
+    )
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "role": "customer",
+        "user_id": user["id"],
+        "name": req.name,
+        "visit_count": user.get("visit_count", 0),
+        "total_spend": float(user.get("total_spend", 0)),
+        "tags": user.get("tags", []),
+        "welcome": welcome,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOKEN REFRESH / LOGOUT / GDPR ERASURE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+@app.post("/api/auth/refresh")
+async def refresh_access_token(req: RefreshRequest, request: Request):
+    """Exchange a refresh token for a new access + refresh token pair."""
+    rate_limiter.check(request, limit=10, window_seconds=60, scope="token_refresh")
+    db = get_db()
+    access_token, new_refresh = await rotate_refresh_token(db, req.refresh_token)
+    return {
+        "access_token": access_token,
+        "refresh_token": new_refresh,
+        "token_type": "bearer",
+    }
+
+
+@app.post("/api/auth/logout")
+async def logout(req: RefreshRequest, current_user: dict = Depends(get_current_user)):
+    """Revoke all refresh tokens for the current user."""
+    db = get_db()
+    await revoke_all_tokens(db, current_user["user_id"])
+    await audit_log(
+        db,
+        actor_id=current_user["user_id"],
+        actor_role=current_user.get("role", "unknown"),
+        action="LOGOUT",
+        resource_type="session",
+        resource_id=current_user["user_id"],
+        restaurant_id=current_user.get("restaurant_id", ""),
+        ip_address="",
+        outcome="success",
+    )
+    return {"detail": "Logged out. All sessions revoked."}
+
+
+@app.delete("/api/customer/account")
+async def delete_account(current_user: dict = Depends(require_customer)):
+    """GDPR Article 17 — Right to Erasure."""
+    import secrets as _secrets
+    db = get_db()
+    user_id = current_user["user_id"]
+    anon_name = f"deleted_{_secrets.token_hex(4)}"
+
+    db.table("user_sessions").update({
+        "name": anon_name,
+        "phone": None,
+        "pin_hash": "DELETED_GDPR",
+        "allergies": [],
+        "last_feedback_comment": None,
+        "table_number": None,
+        "tags": [],
+        "average_rating": None,
+    }).eq("id", user_id).execute()
+
+    db.table("orders").update({"customer_name": anon_name}).eq("user_id", user_id).execute()
+    db.table("bookings").update({"customer_name": anon_name}).eq("user_id", user_id).execute()
+    db.table("feedback").delete().eq("user_id", user_id).execute()
+    await revoke_all_tokens(db, user_id)
+
+    logger.info(
+        f"GDPR_ERASURE: user_id={user_id} pii_anonymised=true health_data_deleted=true "
+        f"timestamp={datetime.now(timezone.utc).isoformat()}"
+    )
+    return {"detail": "Your account and personal data have been deleted."}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -205,11 +386,10 @@ async def customer_login(req: CustomerLoginRequest):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/staff/login", response_model=TokenResponse)
-async def staff_login(req: StaffLoginRequest):
+async def staff_login(req: StaffLoginRequest, request: Request):
+    rate_limiter.check(request, limit=5, window_seconds=60, scope="staff_login")
     db = get_db()
 
-    # Search by username only — no restaurant_id filter
-    # This allows each restaurant's admin to log in without knowing their UUID
     result = (
         db.table("staff_users")
         .select("*")
@@ -223,7 +403,6 @@ async def staff_login(req: StaffLoginRequest):
     if not verify_password(req.password, staff["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect password.")
 
-    # Restaurant ID comes from the staff record itself — not the request
     restaurant_id = staff["restaurant_id"]
 
     token = create_access_token({
@@ -238,9 +417,12 @@ async def staff_login(req: StaffLoginRequest):
         user_id=staff["id"],
         name=req.username,
     )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # RESTAURANT INFO
 # ═══════════════════════════════════════════════════════════════════════════════
+
 @app.get("/api/restaurant/{restaurant_id}")
 async def get_restaurant(restaurant_id: str):
     """Public endpoint — returns basic restaurant info for the header."""
@@ -249,6 +431,7 @@ async def get_restaurant(restaurant_id: str):
     if not result.data:
         raise HTTPException(status_code=404, detail="Restaurant not found")
     return result.data[0]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MENU
@@ -294,26 +477,22 @@ async def delete_menu_item(item_id: str):
 @app.post("/api/orders")
 async def place_order(req: PlaceOrderRequest, current_user: dict = Depends(require_customer)):
     db = get_db()
-    # JWT restaurant_id is the source of truth — prevents cross-tenant data access
     restaurant_id = current_user.get("restaurant_id") or req.restaurant_id or settings.default_restaurant_id
-    logger.info(f"Chat request: user={current_user.get('user_id')} restaurant={restaurant_id} mode={req.mode}")
+    logger.info(f"Order request: user={current_user.get('user_id')} restaurant={restaurant_id}")
     user_id = current_user["user_id"]
 
-    # Fetch customer allergies
-    user_data = db.table("user_sessions").select("allergies").eq("id", user_id).execute()
+    user_data = db.table("user_sessions").select("allergies, pin_hash").eq("id", user_id).execute()
+    if user_data.data and user_data.data[0].get("pin_hash") == "DELETED_GDPR":
+        raise HTTPException(status_code=403, detail="Account deleted. Please register a new account.")
     allergies = (user_data.data[0].get("allergies") or []) if user_data.data else []
 
-    # Fetch menu
     menu = db.table("menu_items").select("*").eq("restaurant_id", restaurant_id).eq("sold_out", False).execute()
     if not menu.data:
-        # Fallback: fetch all items including sold out so AI still has context
         menu = db.table("menu_items").select("*").eq("restaurant_id", restaurant_id).execute()
 
-    # Fetch restaurant AI context
     settings_row = db.table("restaurant_policies").select("ai_context").eq("restaurant_id", restaurant_id).execute()
     ai_context = (settings_row.data[0].get("ai_context") or "") if settings_row.data else ""
 
-    # Parse order via AI
     try:
         parsed = await process_natural_language_order(
             req.natural_language_input,
@@ -334,11 +513,9 @@ async def place_order(req: PlaceOrderRequest, current_user: dict = Depends(requi
             },
         )
 
-    # Get customer name
     user_row = db.table("user_sessions").select("name").eq("id", user_id).execute()
     customer_name = user_row.data[0]["name"] if user_row.data else "Guest"
 
-    # Insert order
     daily_number = await get_next_order_number(db, restaurant_id)
     order_data = {
         "restaurant_id": restaurant_id,
@@ -356,7 +533,6 @@ async def place_order(req: PlaceOrderRequest, current_user: dict = Depends(requi
     result = db.table("orders").insert(order_data).execute()
     order = result.data[0]
 
-    # Notify kitchen via WebSocket
     await manager.broadcast_to_kitchen(restaurant_id, "new_order", {
         "order_id": order["id"],
         "table_number": req.table_number,
@@ -378,11 +554,9 @@ async def place_order(req: PlaceOrderRequest, current_user: dict = Depends(requi
 @app.get("/api/orders")
 async def get_customer_orders(current_user: dict = Depends(get_current_user)):
     db = get_db()
-    # Resolve real user_id from user_sessions if needed
     user_id = current_user["user_id"]
     restaurant_id = current_user.get("restaurant_id") or settings.default_restaurant_id
 
-    # Verify this user_id exists — if not, find by name
     check = db.table("user_sessions").select("id").eq("id", user_id).execute()
     if not check.data:
         by_name = db.table("user_sessions").select("id").eq(
@@ -392,6 +566,7 @@ async def get_customer_orders(current_user: dict = Depends(get_current_user)):
             user_id = by_name.data[0]["id"]
         else:
             raise HTTPException(status_code=404, detail="Session not found. Please log in again.")
+
     logger.info(f"Fetching orders for user={current_user['user_id']} restaurant={current_user.get('restaurant_id')}")
     result = (
         db.table("orders")
@@ -418,12 +593,13 @@ async def modify_order(
     current_user: dict = Depends(require_customer),
 ):
     db = get_db()
-    order = db.table("orders").select("*").eq("id", order_id).execute()
+    # IDOR fix: verify ownership atomically in the query
+    order = db.table("orders").select("*").eq("id", order_id).eq(
+        "user_id", current_user["user_id"]
+    ).execute()
     if not order.data:
         raise HTTPException(status_code=404, detail="Order not found.")
     o = order.data[0]
-    if o["user_id"] != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not your order.")
     if o["status"] not in ("pending", "preparing"):
         raise HTTPException(status_code=409, detail="Order cannot be modified at this stage.")
 
@@ -444,7 +620,6 @@ async def modify_order(
         "modification_status": "requested",
     }).eq("id", order_id).execute()
 
-    # Notify kitchen
     await manager.broadcast_to_kitchen(o["restaurant_id"], "modification_request", {
         "order_id": order_id,
         "modification_text": req.modification_text,
@@ -458,12 +633,13 @@ async def modify_order(
 @app.delete("/api/orders/{order_id}")
 async def cancel_order(order_id: str, current_user: dict = Depends(require_customer)):
     db = get_db()
-    order = db.table("orders").select("*").eq("id", order_id).execute()
+    # IDOR fix: verify ownership atomically in the query
+    order = db.table("orders").select("*").eq("id", order_id).eq(
+        "user_id", current_user["user_id"]
+    ).execute()
     if not order.data:
         raise HTTPException(status_code=404, detail="Order not found.")
     o = order.data[0]
-    if o["user_id"] != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not your order.")
     if o["status"] in ("completed", "cancelled"):
         raise HTTPException(status_code=409, detail="Order already completed or cancelled.")
 
@@ -507,8 +683,6 @@ async def mark_order_ready(order_id: str, current_user: dict = Depends(require_s
         raise HTTPException(status_code=404, detail="Order not found.")
     o = order.data[0]
     db.table("orders").update({"status": "ready"}).eq("id", order_id).execute()
-
-    # Notify customer
     await manager.send_to_customer(o["user_id"], "order_ready", {"order_id": order_id})
     return {"detail": "Order marked ready."}
 
@@ -525,9 +699,7 @@ async def approve_modification(order_id: str):
         items_list = json.loads(items_raw)
     else:
         items_list = items_raw
-    items_summary = ", ".join([
-        f"{i.get('quantity',1)}x {i.get('name','')}" for i in items_list
-    ])
+    items_summary = ", ".join([f"{i.get('quantity',1)}x {i.get('name','')}" for i in items_list])
     order_num = o.get("daily_order_number", "?")
     db.table("orders").update({"modification_status": "approved"}).eq("id", order_id).execute()
     await manager.send_to_customer(o["user_id"], "modification_approved", {
@@ -551,9 +723,7 @@ async def reject_modification(order_id: str):
         items_list = json.loads(items_raw)
     else:
         items_list = items_raw
-    items_summary = ", ".join([
-        f"{i.get('quantity',1)}x {i.get('name','')}" for i in items_list
-    ])
+    items_summary = ", ".join([f"{i.get('quantity',1)}x {i.get('name','')}" for i in items_list])
     order_num = o.get("daily_order_number", "?")
     db.table("orders").update({"modification_status": "rejected"}).eq("id", order_id).execute()
     await manager.send_to_customer(o["user_id"], "modification_rejected", {
@@ -626,9 +796,7 @@ async def approve_cancellation(order_id: str):
                 "cancellation_status": "approved",
             }).eq("id", order_id).execute()
             chat_message = f"✅ Order #{order_num} fully cancelled — all items removed."
-
     else:
-        # Full cancellation
         items_summary = ", ".join([f"{i.get('quantity',1)}x {i.get('name','')}" for i in items_list])
         db.table("orders").update({
             "status": "cancelled",
@@ -648,7 +816,6 @@ async def approve_cancellation(order_id: str):
     return {"detail": "Cancellation approved.", "partial": is_partial}
 
 
-
 @app.put("/api/staff/orders/{order_id}/reject_cancellation", dependencies=[Depends(require_staff)])
 async def reject_cancellation(order_id: str):
     db = get_db()
@@ -661,9 +828,7 @@ async def reject_cancellation(order_id: str):
         items_list = json.loads(items_raw)
     else:
         items_list = items_raw
-    items_summary = ", ".join([
-        f"{i.get('quantity',1)}x {i.get('name','')}" for i in items_list
-    ])
+    items_summary = ", ".join([f"{i.get('quantity',1)}x {i.get('name','')}" for i in items_list])
     order_num = o.get("daily_order_number", "?")
     db.table("orders").update({"cancellation_status": "rejected"}).eq("id", order_id).execute()
     await manager.send_to_customer(o["user_id"], "cancellation_rejected", {
@@ -674,8 +839,9 @@ async def reject_cancellation(order_id: str):
     })
     return {"detail": "Cancellation rejected."}
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# FEATURE 2: STAFF AI CHAT
+# STAFF AI CHAT
 # ─────────────────────────────────────────────────────────────────────────────
 
 class StaffChatRequest(BaseModel):
@@ -688,17 +854,12 @@ async def staff_chat(
     req: StaffChatRequest,
     current_user: dict = Depends(require_staff),
 ):
-    """
-    Staff-only AI assistant with full operational context.
-    Can answer questions about orders, bookings, customers, revenue.
-    Can send messages to specific customer tables.
-    """
+    """Staff-only AI assistant with full operational context."""
     db = get_db()
     restaurant_id = current_user["restaurant_id"]
     staff_name = current_user.get("name", "Staff")
     staff_role = current_user.get("role", "staff")
 
-    # Fetch all operational data
     active_orders = (
         db.table("orders")
         .select("*")
@@ -712,7 +873,6 @@ async def staff_chat(
         if isinstance(o.get("items"), str):
             o["items"] = json.loads(o["items"])
 
-    # Upcoming bookings (next 7 days)
     from datetime import timedelta as _td
     now = datetime.now(timezone.utc)
     week_ahead = (now + _td(days=7)).isoformat()
@@ -763,14 +923,12 @@ async def staff_chat(
         ai_context=ai_context,
     )
 
-    # ── Handle send_customer_message action ───────────────────────────────────
     if result.get("action_type") == "send_customer_message":
         action_data = result.get("action_data", {})
         table_number = action_data.get("table_number")
         customer_message = action_data.get("message", "")
 
         if table_number and customer_message:
-            # Find customers at this table and send them a WebSocket message
             seated = [
                 c for c in customers
                 if str(c.get("table_number")) == str(table_number)
@@ -781,11 +939,10 @@ async def staff_chat(
                     "from": "Restaurant",
                     "chat_message": f"💬 Message from restaurant: {customer_message}",
                 })
-            logger.info(
-                f"Staff message sent to table {table_number}: {customer_message}"
-            )
+            logger.info(f"Staff message sent to table {table_number}: {customer_message}")
 
     return result
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TABLES & BILLING
@@ -835,10 +992,7 @@ async def close_table(table_number: str, current_user: dict = Depends(require_st
     if not orders.data:
         raise HTTPException(status_code=404, detail="No active orders for this table.")
 
-    blocking_orders = [
-        o for o in orders.data
-        if o.get("status") in ("pending", "preparing")
-    ]
+    blocking_orders = [o for o in orders.data if o.get("status") in ("pending", "preparing")]
     if blocking_orders:
         blocking_nums = [
             f"Order #{o.get('daily_order_number', '?')} ({o.get('status')})"
@@ -855,14 +1009,12 @@ async def close_table(table_number: str, current_user: dict = Depends(require_st
     total = sum(float(o.get("price", 0)) for o in orders.data)
     user_ids = list({o["user_id"] for o in orders.data if o.get("user_id")})
 
-    # Mark all orders completed — do this first, separately from CRM
     for o in orders.data:
         try:
             db.table("orders").update({"status": "completed"}).eq("id", o["id"]).execute()
         except Exception as e:
             logger.error(f"Failed to mark order {o['id']} completed: {e}")
 
-    # CRM update — wrapped in its own try/except so a column error never kills this
     crm_errors = []
     for uid in user_ids:
         try:
@@ -871,7 +1023,12 @@ async def close_table(table_number: str, current_user: dict = Depends(require_st
                 continue
             u = user.data[0]
             new_visit = int(u.get("visit_count") or 0) + 1
-            new_spend = float(u.get("total_spend") or 0) + total
+            # Per-user spend: sum this user's own orders only
+            user_orders_total = sum(
+                float(o.get("price", 0)) for o in orders.data
+                if o.get("user_id") == uid
+            )
+            new_spend = float(u.get("total_spend") or 0) + user_orders_total
             tags = compute_tags(new_visit, new_spend, u.get("last_visit"))
 
             db.table("user_sessions").update({
@@ -879,15 +1036,12 @@ async def close_table(table_number: str, current_user: dict = Depends(require_st
                 "total_spend": round(new_spend, 2),
                 "tags": tags,
                 "last_visit": datetime.now(timezone.utc).isoformat(),
-                # Do NOT clear table_number here — needed for feedback after close
             }).eq("id", uid).execute()
             logger.info(f"CRM updated: uid={uid} visits={new_visit} spend={new_spend} tags={tags}")
-
         except Exception as e:
             crm_errors.append(str(e))
             logger.error(f"CRM update failed for {uid}: {e}")
 
-    # Notify customers — wrapped separately
     for uid in user_ids:
         try:
             await manager.send_to_customer(uid, "feedback_requested", {
@@ -901,35 +1055,43 @@ async def close_table(table_number: str, current_user: dict = Depends(require_st
         except Exception as e:
             logger.error(f"WebSocket notify failed for {uid}: {e}")
 
+    await audit_log(
+        db,
+        actor_id=current_user["user_id"],
+        actor_role=current_user.get("role", "staff"),
+        action="CLOSE_TABLE",
+        resource_type="table",
+        resource_id=table_number,
+        restaurant_id=restaurant_id,
+        ip_address="",
+        outcome="success",
+        details={"total": total, "orders_closed": len(orders.data)},
+    )
+
     response = {
         "detail": f"Table {table_number} closed. Total: AED {total:.2f}",
         "total": total,
         "orders_closed": len(orders.data),
     }
     if crm_errors:
-        response["crm_warnings"] = crm_errors  # visible in response but doesn't fail the close
+        response["crm_warnings"] = crm_errors
     return response
-    
+
+
 @app.get("/api/my-bill")
 async def get_my_bill(current_user: dict = Depends(get_current_user)):
-    """
-    Returns current active bill AND full past bill history
-    for this customer, grouped by visit date.
-    """
+    """Returns current active bill AND full past bill history grouped by visit date."""
     db = get_db()
     user_id = current_user["user_id"]
     restaurant_id = current_user.get("restaurant_id") or settings.default_restaurant_id
 
-    user_data = db.table("user_sessions").select(
-        "id, table_number, name"
-    ).eq("id", user_id).execute()
+    user_data = db.table("user_sessions").select("id, table_number, name").eq("id", user_id).execute()
 
     if not user_data.data:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     table_number = user_data.data[0].get("table_number")
 
-    # ── Current active orders ─────────────────────────────────────────────────
     if table_number:
         active_result = (
             db.table("orders")
@@ -958,7 +1120,6 @@ async def get_my_bill(current_user: dict = Depends(get_current_user)):
 
     active_total = round(sum(float(o.get("price", 0)) for o in active_orders), 2)
 
-    # ── Past completed orders (all time, this restaurant) ────────────────────
     past_result = (
         db.table("orders")
         .select("*")
@@ -974,21 +1135,18 @@ async def get_my_bill(current_user: dict = Depends(get_current_user)):
         if isinstance(o.get("items"), str):
             o["items"] = json.loads(o["items"])
 
-    # ── Group past orders by date ─────────────────────────────────────────────
     from collections import defaultdict
     past_by_date: dict = defaultdict(list)
     for o in past_orders:
         try:
             created = datetime.fromisoformat(o["created_at"])
-            date_key = created.strftime("%d %B %Y")  # e.g. "15 January 2025"
+            date_key = created.strftime("%d %B %Y")
         except Exception:
             date_key = "Unknown date"
         past_by_date[date_key].append(o)
 
-    # Build past sessions (group by date + table)
     past_sessions = []
     for date_str, date_orders in past_by_date.items():
-        # Group by table within the date
         table_groups: dict = defaultdict(list)
         for o in date_orders:
             tbl = o.get("table_number") or "Unknown"
@@ -1012,6 +1170,7 @@ async def get_my_bill(current_user: dict = Depends(get_current_user)):
         "lifetime_total": round(sum(s["total"] for s in past_sessions), 2),
     }
 
+
 @app.get("/api/bill/{table_number}")
 async def get_bill(table_number: str, restaurant_id: Optional[str] = None):
     db = get_db()
@@ -1034,12 +1193,11 @@ async def get_bill(table_number: str, restaurant_id: Optional[str] = None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEATURE 3: TABLE INVENTORY MANAGEMENT
+# TABLE INVENTORY MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/staff/tables-inventory", dependencies=[Depends(require_staff)])
 async def get_tables_inventory(current_user: dict = Depends(require_staff)):
-    """Get all tables with their capacities for this restaurant."""
     db = get_db()
     result = (
         db.table("tables_inventory")
@@ -1052,11 +1210,7 @@ async def get_tables_inventory(current_user: dict = Depends(require_staff)):
 
 
 @app.post("/api/staff/tables-inventory", dependencies=[Depends(require_staff)])
-async def create_table(
-    table_data: dict,
-    current_user: dict = Depends(require_staff),
-):
-    """Add a new table to the inventory."""
+async def create_table(table_data: dict, current_user: dict = Depends(require_staff)):
     db = get_db()
     result = db.table("tables_inventory").insert({
         "restaurant_id": current_user["restaurant_id"],
@@ -1069,7 +1223,6 @@ async def create_table(
 
 @app.put("/api/staff/tables-inventory/{table_id}", dependencies=[Depends(require_staff)])
 async def update_table(table_id: str, table_data: dict):
-    """Update table capacity or active status."""
     db = get_db()
     updates = {}
     if "capacity" in table_data:
@@ -1078,17 +1231,76 @@ async def update_table(table_id: str, table_data: dict):
         updates["is_active"] = bool(table_data["is_active"])
     if "table_number" in table_data:
         updates["table_number"] = str(table_data["table_number"])
-
     result = db.table("tables_inventory").update(updates).eq("id", table_id).execute()
     return result.data[0]
 
 
 @app.delete("/api/staff/tables-inventory/{table_id}", dependencies=[Depends(require_staff)])
 async def delete_table(table_id: str):
-    """Remove a table from inventory."""
     db = get_db()
     db.table("tables_inventory").delete().eq("id", table_id).execute()
     return {"detail": "Table removed."}
+
+
+# ─── Table availability rules ────────────────────────────────────────────────
+
+@app.get("/api/staff/availability-rules", dependencies=[Depends(require_staff)])
+async def get_availability_rules(current_user: dict = Depends(require_staff)):
+    db = get_db()
+    rules = db.table("table_availability_rules").select(
+        "*, tables_inventory(table_number, capacity)"
+    ).eq("restaurant_id", current_user["restaurant_id"]).order("created_at", desc=True).execute()
+    return rules.data
+
+
+@app.post("/api/staff/availability-rules", dependencies=[Depends(require_staff)])
+async def create_availability_rule(rule: dict, current_user: dict = Depends(require_staff)):
+    db = get_db()
+    rule["restaurant_id"] = current_user["restaurant_id"]
+
+    # Strip empty strings → None so PostgreSQL doesn't reject them
+    for field in ["start_datetime", "end_datetime", "blackout_date", "start_time", "end_time"]:
+        if field in rule and rule[field] == "":
+            rule[field] = None
+    if "day_of_week" in rule and rule["day_of_week"] == "":
+        rule["day_of_week"] = None
+
+    result = db.table("table_availability_rules").insert(rule).execute()
+    return result.data[0]
+
+
+@app.delete("/api/staff/availability-rules/{rule_id}", dependencies=[Depends(require_staff)])
+async def delete_availability_rule(rule_id: str):
+    db = get_db()
+    db.table("table_availability_rules").delete().eq("id", rule_id).execute()
+    return {"detail": "Rule deleted."}
+
+
+# ─── Restaurant blackout dates ────────────────────────────────────────────────
+
+@app.get("/api/staff/blackout-dates", dependencies=[Depends(require_staff)])
+async def get_blackout_dates(current_user: dict = Depends(require_staff)):
+    db = get_db()
+    result = db.table("restaurant_blackout_dates").select("*").eq(
+        "restaurant_id", current_user["restaurant_id"]
+    ).order("blackout_date").execute()
+    return result.data
+
+
+@app.post("/api/staff/blackout-dates", dependencies=[Depends(require_staff)])
+async def create_blackout_date(data: dict, current_user: dict = Depends(require_staff)):
+    db = get_db()
+    data["restaurant_id"] = current_user["restaurant_id"]
+    result = db.table("restaurant_blackout_dates").insert(data).execute()
+    return result.data[0]
+
+
+@app.delete("/api/staff/blackout-dates/{date_id}", dependencies=[Depends(require_staff)])
+async def delete_blackout_date(date_id: str):
+    db = get_db()
+    db.table("restaurant_blackout_dates").delete().eq("id", date_id).execute()
+    return {"detail": "Blackout date removed."}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BOOKINGS
@@ -1116,19 +1328,22 @@ async def cancel_booking(booking_id: str, current_user: dict = Depends(require_c
     b = booking.data[0]
     if b["user_id"] != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="Not your booking.")
-    from datetime import datetime
-    bt = datetime.fromisoformat(b["booking_time"])
+    from datetime import datetime as _dtt
+    bt = _dtt.fromisoformat(b["booking_time"])
     ok, err = can_cancel_booking(bt)
     if not ok:
         raise HTTPException(status_code=409, detail=err)
     db.table("bookings").update({"status": "cancelled"}).eq("id", booking_id).execute()
     return {"detail": "Booking cancelled."}
 
+
 @app.post("/api/bookings")
 async def create_booking(
     req: CreateBookingRequest,
+    request: Request,
     current_user: dict = Depends(require_customer),
 ):
+    rate_limiter.check(request, limit=5, window_seconds=3600, scope="booking")
     db = get_db()
     restaurant_id = req.restaurant_id or current_user.get("restaurant_id") or settings.default_restaurant_id
     user_id = current_user["user_id"]
@@ -1141,7 +1356,20 @@ async def create_booking(
     if not valid:
         raise HTTPException(status_code=422, detail=err)
 
-    # Check for duplicate
+    # Always check restaurant blackout dates first
+    try:
+        blackout_result = db.table("restaurant_blackout_dates").select("*").eq(
+            "restaurant_id", restaurant_id
+        ).execute()
+        from app.booking_service import is_restaurant_open_for_booking
+        open_ok, open_err = is_restaurant_open_for_booking(booking_time, blackout_result.data or [])
+        if not open_ok:
+            raise HTTPException(status_code=409, detail=open_err)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Blackout check failed: {e}")
+
     existing = db.table("bookings").select("*").eq("restaurant_id", restaurant_id).execute()
     if check_duplicate_booking(existing.data, user_id, booking_time):
         raise HTTPException(status_code=409, detail="You already have a booking around that time.")
@@ -1149,7 +1377,6 @@ async def create_booking(
     assigned_table_id = None
     assigned_table_number = None
 
-    # ── Try smart table allocation (only if tables_inventory exists) ──────────
     try:
         tables_result = (
             db.table("tables_inventory")
@@ -1166,15 +1393,23 @@ async def create_booking(
                 get_available_slots,
             )
 
+            rules_result = db.table("table_availability_rules").select("*").eq(
+                "restaurant_id", restaurant_id
+            ).execute()
+            availability_rules = rules_result.data or []
+
             booked_ids = get_tables_booked_in_slot(existing.data, booking_time)
-            best_table = find_best_table(tables_result.data, req.party_size, booked_ids)
+            best_table = find_best_table(
+                tables_result.data,
+                req.party_size,
+                booked_ids,
+                availability_rules=availability_rules,
+                booking_time=booking_time,
+            )
 
             if not best_table:
                 available_slots = get_available_slots(
-                    tables_result.data,
-                    existing.data,
-                    req.party_size,
-                    booking_time,
+                    tables_result.data, existing.data, req.party_size, booking_time,
                 )
                 if available_slots:
                     slots_str = ", ".join(available_slots[:5])
@@ -1188,10 +1423,7 @@ async def create_booking(
                 else:
                     raise HTTPException(
                         status_code=409,
-                        detail=(
-                            f"No tables available for {req.party_size} guests on that date. "
-                            f"Please try a different date."
-                        )
+                        detail=f"No tables available for {req.party_size} guests on that date. Please try a different date."
                     )
 
             assigned_table_id = best_table["id"]
@@ -1201,15 +1433,13 @@ async def create_booking(
                 f"(capacity {best_table['capacity']}) for party of {req.party_size}"
             )
         else:
-            # No table inventory configured — use legacy capacity check
             raise ValueError("no_inventory")
 
     except HTTPException:
-        raise  # Re-raise HTTP errors from smart allocation
+        raise
     except Exception as e:
         if "no_inventory" not in str(e):
             logger.warning(f"Smart table allocation failed, using legacy: {e}")
-        # Legacy fallback
         settings_row = db.table("restaurant_policies").select(
             "table_count, max_party_size"
         ).eq("restaurant_id", restaurant_id).execute()
@@ -1233,7 +1463,6 @@ async def create_booking(
         "special_requests": req.special_requests,
     }
 
-    # Only add table assignment fields if they exist in DB
     if assigned_table_id:
         try:
             insert_data["assigned_table_id"] = assigned_table_id
@@ -1259,18 +1488,10 @@ async def submit_feedback(
     req: FeedbackRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Submit feedback and immediately update CRM:
-    - Stores the rating and comment
-    - Updates average_rating on user_sessions
-    - Updates tags (high raters get better service)
-    - Logs last feedback details for staff CRM view
-    """
     db = get_db()
     restaurant_id = req.restaurant_id or current_user.get("restaurant_id") or settings.default_restaurant_id
     user_id = current_user["user_id"]
 
-    # Resolve user_id if needed
     user_data = db.table("user_sessions").select("*").eq("id", user_id).execute()
     if not user_data.data:
         by_name = db.table("user_sessions").select("*").eq(
@@ -1282,8 +1503,33 @@ async def submit_feedback(
         else:
             raise HTTPException(status_code=404, detail="Session not found.")
 
-    # Save feedback record
-    feedback_result = db.table("feedback").insert({
+    u = user_data.data[0]
+
+    # Server-side feedback gaming prevention:
+    # Check if feedback was already submitted since the last table close (last_visit)
+    last_visit = u.get("last_visit")
+    if last_visit:
+        last_feedback_check = db.table("feedback").select("created_at").eq(
+            "user_id", user_id
+        ).eq("restaurant_id", restaurant_id).gte(
+            "created_at", last_visit
+        ).order("created_at", desc=True).limit(1).execute()
+
+        if last_feedback_check.data:
+            raise HTTPException(
+                status_code=409,
+                detail="You have already submitted feedback for this visit. Thank you!"
+            )
+        by_name = db.table("user_sessions").select("*").eq(
+            "restaurant_id", restaurant_id
+        ).eq("name", current_user.get("name", "")).execute()
+        if by_name.data:
+            user_id = by_name.data[0]["id"]
+            user_data = by_name
+        else:
+            raise HTTPException(status_code=404, detail="Session not found.")
+
+    db.table("feedback").insert({
         "restaurant_id": restaurant_id,
         "user_id": user_id,
         "ratings": json.dumps(req.order_ratings or {}),
@@ -1291,23 +1537,16 @@ async def submit_feedback(
         "comments": req.comments,
     }).execute()
 
-    # ── Update CRM with feedback data ─────────────────────────────────
     u = user_data.data[0]
     current_count = int(u.get("total_feedback_count") or 0)
     current_avg = float(u.get("average_rating") or 0)
     new_count = current_count + 1
+    new_avg = round(((current_avg * current_count) + req.overall_rating) / new_count, 2)
 
-    # Weighted rolling average
-    new_avg = round(
-        ((current_avg * current_count) + req.overall_rating) / new_count, 2
-    )
-
-    # Recompute tags including feedback-based ones
     visit_count = int(u.get("visit_count") or 0)
     total_spend = float(u.get("total_spend") or 0)
     base_tags = compute_tags(visit_count, total_spend, u.get("last_visit"))
 
-    # Add loyalty tag for consistent high raters
     if new_avg >= 4.5 and new_count >= 3:
         if "Brand Ambassador" not in base_tags:
             base_tags.append("Brand Ambassador")
@@ -1323,21 +1562,19 @@ async def submit_feedback(
         "tags": base_tags,
     }).eq("id", user_id).execute()
 
-    logger.info(
-        f"Feedback saved: user={user_id} rating={req.overall_rating} "
-        f"new_avg={new_avg} count={new_count}"
-    )
+    logger.info(f"Feedback saved: user={user_id} rating={req.overall_rating} new_avg={new_avg} count={new_count}")
 
     return {
         "detail": "Feedback submitted. Thank you!",
         "average_rating": new_avg,
         "feedback_count": new_count,
     }
-    
+
+
 class PartialCancelRequest(BaseModel):
     order_id: str
-    cancel_type: str  # "full" | "partial"
-    items_to_cancel: Optional[List[str]] = []  # item names to remove (for partial)
+    cancel_type: str
+    items_to_cancel: Optional[List[str]] = []
 
 
 @app.post("/api/orders/cancel-request")
@@ -1345,33 +1582,21 @@ async def request_cancellation(
     req: PartialCancelRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Request cancellation of a full order or specific items within it.
-    Always goes to kitchen for approval — never auto-cancels.
-    """
     db = get_db()
     user_id = current_user["user_id"]
     restaurant_id = current_user.get("restaurant_id") or settings.default_restaurant_id
 
-    order = db.table("orders").select("*").eq("id", req.order_id).execute()
+    # IDOR fix: verify ownership atomically
+    order = db.table("orders").select("*").eq("id", req.order_id).eq("user_id", user_id).execute()
     if not order.data:
         raise HTTPException(status_code=404, detail="Order not found.")
     o = order.data[0]
 
-    if o.get("user_id") != user_id:
-        raise HTTPException(status_code=403, detail="Not your order.")
-
     if o.get("status") in ("completed", "cancelled"):
-        raise HTTPException(
-            status_code=409,
-            detail="This order is already completed or cancelled."
-        )
+        raise HTTPException(status_code=409, detail="This order is already completed or cancelled.")
 
     if o.get("cancellation_status") == "requested":
-        raise HTTPException(
-            status_code=409,
-            detail="A cancellation request is already pending for this order."
-        )
+        raise HTTPException(status_code=409, detail="A cancellation request is already pending for this order.")
 
     items_raw = o.get("items", "[]")
     if isinstance(items_raw, str):
@@ -1379,29 +1604,18 @@ async def request_cancellation(
     else:
         items_list = items_raw
 
-    items_summary = ", ".join([
-        f"{i.get('quantity', 1)}x {i.get('name', '')}" for i in items_list
-    ])
+    items_summary = ", ".join([f"{i.get('quantity', 1)}x {i.get('name', '')}" for i in items_list])
     order_num = o.get("daily_order_number", "?")
 
     if req.cancel_type == "partial" and req.items_to_cancel:
-        # Validate requested items exist in order
         order_item_names = [i.get("name", "").lower() for i in items_list]
-        invalid = [
-            item for item in req.items_to_cancel
-            if item.lower() not in order_item_names
-        ]
+        invalid = [item for item in req.items_to_cancel if item.lower() not in order_item_names]
         if invalid:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Items not found in order: {', '.join(invalid)}"
-            )
-
+            raise HTTPException(status_code=422, detail=f"Items not found in order: {', '.join(invalid)}")
         cancel_desc = f"Remove: {', '.join(req.items_to_cancel)}"
     else:
         cancel_desc = "Full order cancellation"
 
-    # Send to kitchen
     db.table("orders").update({
         "cancellation_status": "requested",
         "modification_text": cancel_desc,
@@ -1418,13 +1632,9 @@ async def request_cancellation(
         "cancel_description": cancel_desc,
     })
 
-    return {
-        "detail": (
-            f"Cancellation request sent to kitchen for Order #{order_num}. "
-            f"Request: {cancel_desc}"
-        )
-    }
-    
+    return {"detail": f"Cancellation request sent to kitchen for Order #{order_num}. Request: {cancel_desc}"}
+
+
 @app.get("/api/staff/bookings", dependencies=[Depends(require_staff)])
 async def staff_get_bookings(current_user: dict = Depends(require_staff)):
     db = get_db()
@@ -1451,11 +1661,11 @@ async def staff_cancel_booking(booking_id: str):
     db.table("bookings").update({"status": "cancelled"}).eq("id", booking_id).execute()
     return {"detail": "Booking cancelled."}
 
+
 @app.delete("/api/staff/bookings/{booking_id}/purge", dependencies=[Depends(require_staff)])
 async def purge_booking(booking_id: str, current_user: dict = Depends(require_staff)):
     """Permanently delete a cancelled booking record."""
     db = get_db()
-    # Verify it belongs to this restaurant and is cancelled
     booking = db.table("bookings").select("*").eq("id", booking_id).execute()
     if not booking.data:
         raise HTTPException(status_code=404, detail="Booking not found.")
@@ -1466,6 +1676,7 @@ async def purge_booking(booking_id: str, current_user: dict = Depends(require_st
         raise HTTPException(status_code=409, detail="Only cancelled bookings can be purged.")
     db.table("bookings").delete().eq("id", booking_id).execute()
     return {"detail": "Booking permanently deleted."}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CRM
@@ -1485,12 +1696,23 @@ async def get_crm(current_user: dict = Depends(require_staff)):
     )
     customers = result.data
 
-    # ── Compute restaurant-level ARPU ─────────────────────────────────────────
+    await audit_log(
+        db,
+        actor_id=current_user["user_id"],
+        actor_role=current_user.get("role", "staff"),
+        action="VIEW_CRM",
+        resource_type="user_sessions",
+        resource_id="all",
+        restaurant_id=restaurant_id,
+        ip_address="",
+        outcome="success",
+        details={"customer_count": len(customers)},
+    )
+
     total_revenue = sum(float(c.get("total_spend") or 0) for c in customers)
     paying_customers = [c for c in customers if float(c.get("total_spend") or 0) > 0]
     arpu = round(total_revenue / len(paying_customers), 2) if paying_customers else 0
 
-    # ── Compute per-customer ARPU (revenue per visit) ─────────────────────────
     for c in customers:
         visits = int(c.get("visit_count") or 0)
         spend = float(c.get("total_spend") or 0)
@@ -1502,12 +1724,13 @@ async def get_crm(current_user: dict = Depends(require_staff)):
             "total_customers": len(customers),
             "paying_customers": len(paying_customers),
             "total_revenue": round(total_revenue, 2),
-            "arpu": arpu,  # Average Revenue Per User across restaurant
+            "arpu": arpu,
             "average_visits": round(
                 sum(int(c.get("visit_count") or 0) for c in customers) / len(customers), 1
             ) if customers else 0,
         }
     }
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SETTINGS
@@ -1516,7 +1739,9 @@ async def get_crm(current_user: dict = Depends(require_staff)):
 @app.get("/api/staff/settings", dependencies=[Depends(require_staff)])
 async def get_settings(current_user: dict = Depends(require_staff)):
     db = get_db()
-    result = db.table("restaurant_policies").select("*").eq("restaurant_id", current_user["restaurant_id"]).execute()
+    result = db.table("restaurant_policies").select("*").eq(
+        "restaurant_id", current_user["restaurant_id"]
+    ).execute()
     return result.data[0] if result.data else {}
 
 
@@ -1549,12 +1774,9 @@ async def create_staff_user(req: StaffUserCreate, current_user: dict = Depends(r
     }).execute()
     return {"detail": "Staff user created.", "id": result.data[0]["id"]}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# chat endpoint
-# ═══════════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHAT ENDPOINT — PASTE THIS ENTIRE BLOCK TO REPLACE YOUR EXISTING /api/chat
+# CHAT ENDPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ChatRequest(BaseModel):
@@ -1563,17 +1785,16 @@ class ChatRequest(BaseModel):
     restaurant_id: Optional[str] = None
     table_number: Optional[str] = None
     conversation_history: list = []
-    # State machine fields — stored in frontend sessionStorage, sent each request
-    pending_action: Optional[str] = None       # "cancel_selection"|"mod_selection"|"mod_details"
+    pending_action: Optional[str] = None
     pending_order_id: Optional[str] = None
     pending_order_num: Optional[int] = None
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user)):
+async def chat(req: ChatRequest, request: Request, current_user: dict = Depends(get_current_user)):
+    rate_limiter.check(request, limit=20, window_seconds=60, scope="chat")
     db = get_db()
 
-    # Staff tokens must not use the customer chat endpoint
     if current_user.get("role") in ("admin", "chef", "manager"):
         raise HTTPException(
             status_code=403,
@@ -1589,10 +1810,19 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
 
     logger.info(f"Chat: user={user_id} restaurant={restaurant_id} mode={req.mode} pending={req.pending_action}")
 
-    # ── Resolve user_id against user_sessions ─────────────────────────────
-    user_data = db.table("user_sessions").select(
-        "id, allergies, name"
-    ).eq("id", user_id).execute()
+    # Sanitise message before it reaches the LLM
+    try:
+        clean_message = sanitise_user_input(req.message, context="customer_chat")
+    except HTTPException:
+        security_tracker.record(user_id, "prompt_injection")
+        if security_tracker.should_suspend(user_id):
+            db.table("user_sessions").update({
+                "suspended_until": (datetime.now(timezone.utc).isoformat()),
+            }).eq("id", user_id).execute()
+            raise HTTPException(status_code=403, detail="Session temporarily suspended due to policy violations.")
+        raise
+
+    user_data = db.table("user_sessions").select("id, allergies, name, pin_hash").eq("id", user_id).execute()
 
     if not user_data.data:
         by_name = db.table("user_sessions").select(
@@ -1605,34 +1835,37 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
             user_data = by_name
             logger.info(f"Resolved user_id by name: {user_id}")
         else:
-            raise HTTPException(
-                status_code=404,
-                detail="Session not found. Please log out and log back in."
-            )
+            raise HTTPException(status_code=404, detail="Session not found. Please log out and log back in.")
 
     allergies = (user_data.data[0].get("allergies") or []) if user_data.data else []
     customer_name = (user_data.data[0].get("name") or "Guest") if user_data.data else "Guest"
+    # Guard against deleted accounts with unexpired JWT tokens
+    # (15-minute window between deletion and token expiry)
+    if user_data.data and user_data.data[0].get("pin_hash") == "DELETED_GDPR":
+        raise HTTPException(
+            status_code=403,
+            detail="This account has been deleted. Please register a new account."
+        )
 
-    # ── Fetch menu and settings ───────────────────────────────────────────
     menu = db.table("menu_items").select("*").eq("restaurant_id", restaurant_id).execute()
-    settings_row = db.table("restaurant_policies").select(
-        "ai_context"
-    ).eq("restaurant_id", restaurant_id).execute()
-    ai_context = (settings_row.data[0].get("ai_context") or "") if settings_row.data else ""
+    settings_row = db.table("restaurant_policies").select("ai_context").eq(
+        "restaurant_id", restaurant_id
+    ).execute()
+    ai_context_raw = (settings_row.data[0].get("ai_context") or "") if settings_row.data else ""
+    # Sanitise admin-injected context before it enters the system prompt
+    ai_context = sanitise_admin_context(ai_context_raw) if ai_context_raw else ""
 
-    # ── Always fetch active orders upfront (needed for cancel/modify) ─────
     active_orders_result = db.table("orders").select("*").eq(
         "user_id", user_id
     ).eq("restaurant_id", restaurant_id).in_(
-        "status", ["pending", "preparing"]
+        "status", ["pending", "preparing", "ready"]
     ).order("daily_order_number").execute()
     active_orders = active_orders_result.data or []
 
-    # ── Run state machine ─────────────────────────────────────────────────
     from app.chat_service import process_chat
     try:
         result = await process_chat(
-            message=req.message,
+            message=clean_message,
             mode=req.mode,
             restaurant_id=restaurant_id,
             table_number=req.table_number,
@@ -1649,14 +1882,10 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
         logger.error(f"Chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
 
-    # ── Persist newly detected allergies ──────────────────────────────────
     if result.get("detected_allergies"):
         merged = list(set(allergies) | set(result["detected_allergies"]))
-        db.table("user_sessions").update(
-            {"allergies": merged}
-        ).eq("id", user_id).execute()
+        db.table("user_sessions").update({"allergies": merged}).eq("id", user_id).execute()
 
-    # ── Handle cancel requests (can be multiple orders) ───────────────────
     if result.get("action_type") == "cancel_request":
         target_orders = result.get("target_orders", [])
         for t in target_orders:
@@ -1665,10 +1894,7 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
             items_summary = t["items_summary"]
             items_list = t["items_list"]
 
-            # Check not already requested
-            existing = db.table("orders").select(
-                "cancellation_status, status"
-            ).eq("id", order_id).execute()
+            existing = db.table("orders").select("cancellation_status, status").eq("id", order_id).execute()
             if existing.data:
                 cur = existing.data[0]
                 if cur.get("cancellation_status") == "requested":
@@ -1676,9 +1902,7 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                 if cur.get("status") in ("cancelled", "completed"):
                     continue
 
-            db.table("orders").update(
-                {"cancellation_status": "requested"}
-            ).eq("id", order_id).execute()
+            db.table("orders").update({"cancellation_status": "requested"}).eq("id", order_id).execute()
 
             await manager.broadcast_to_kitchen(restaurant_id, "cancellation_request", {
                 "order_id": order_id,
@@ -1690,16 +1914,13 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
             })
             logger.info(f"Cancellation requested: order #{order_num} id={order_id}")
 
-    # ── Handle modification request (single order) ────────────────────────
     if result.get("action_type") == "mod_request":
         order_id = result.get("target_order_id")
         order_num = result.get("target_order_num")
         modification_text = result.get("modification_text", "")
 
         if order_id:
-            existing = db.table("orders").select(
-                "modification_status, status"
-            ).eq("id", order_id).execute()
+            existing = db.table("orders").select("modification_status, status").eq("id", order_id).execute()
             if existing.data:
                 cur = existing.data[0]
                 if cur.get("modification_status") != "requested" and cur.get("status") not in ("cancelled", "completed"):
@@ -1708,14 +1929,12 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                         "modification_text": modification_text,
                     }).eq("id", order_id).execute()
 
-                    # Get full order for kitchen broadcast
                     full_order = db.table("orders").select("*").eq("id", order_id).execute()
                     items_list = []
                     items_summary = ""
                     if full_order.data:
-                        items_list, items_summary = __import__(
-                            "app.chat_service", fromlist=["get_items_summary"]
-                        ).get_items_summary(full_order.data[0])
+                        from app.chat_service import get_items_summary
+                        items_list, items_summary = get_items_summary(full_order.data[0])
 
                     await manager.broadcast_to_kitchen(restaurant_id, "modification_request", {
                         "order_id": order_id,
@@ -1728,8 +1947,7 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                     })
                     logger.info(f"Modification requested: order #{order_num} id={order_id} — {modification_text}")
 
-    # ── Auto-place order when AI mode is ordering ─────────────────────────
-    msg_lower = req.message.lower().strip()
+    msg_lower = clean_message.lower().strip()
     is_question = msg_lower.endswith("?") or msg_lower.startswith((
         "what", "how", "do you", "is there", "can i", "menu", "show",
         "hi", "hello", "hey", "tell me", "list", "what's", "whats",
@@ -1738,63 +1956,79 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
         "what do you have", "options", "specials",
     )
 
-    # Never auto-order if this was a cancel/modify/state-machine message
     skip_order = (
         is_question
         or result.get("action_type") in ("cancel_request", "mod_request")
         or result.get("new_pending_action") is not None
-        or req.pending_action is not None  # still in a state machine flow
+        or req.pending_action is not None
+        or result.get("allergy_gate") is True
     )
 
     mode_is_ordering = result.get("new_mode") == "ordering" or req.mode == "ordering"
-    is_actual_order = mode_is_ordering and not skip_order and len(req.message.strip()) > 3
+    is_actual_order = mode_is_ordering and not skip_order and len(clean_message.strip()) > 3
 
     if is_actual_order and req.table_number:
-        logger.info(f"Attempting order: '{req.message}' table={req.table_number}")
+        logger.info(f"Attempting order: '{clean_message}' table={req.table_number}")
         try:
             import json as _json
             from app.order_service import process_natural_language_order
-            parsed = await process_natural_language_order(
-                req.message, menu.data, allergies, ai_context
-            )
+            parsed = await process_natural_language_order(clean_message, menu.data, allergies, ai_context)
             if parsed.items:
-                daily_number = await get_next_order_number(db, restaurant_id)
-                order_data = {
-                    "restaurant_id": restaurant_id,
-                    "user_id": user_id,
-                    "customer_name": customer_name,
-                    "table_number": req.table_number,
-                    "items": _json.dumps([i.model_dump() for i in parsed.items]),
-                    "price": parsed.total,
-                    "status": "pending",
-                    "cancellation_status": "none",
-                    "modification_status": "none",
-                    "allergy_warnings": parsed.allergy_warnings,
-                    "daily_order_number": daily_number,
-                }
-                order_result = db.table("orders").insert(order_data).execute()
-                order = order_result.data[0]
-                await manager.broadcast_to_kitchen(restaurant_id, "new_order", {
-                    "order_id": order["id"],
-                    "order_number": daily_number,
-                    "table_number": req.table_number,
-                    "customer_name": customer_name,
-                    "items": [i.model_dump() for i in parsed.items],
-                    "total": parsed.total,
-                    "allergy_warnings": parsed.allergy_warnings,
-                })
-                result["order_placed"] = True
-                result["order_id"] = order["id"]
-                result["order_total"] = parsed.total
-                result["order_number"] = daily_number
-                logger.info(f"Order #{daily_number} placed: {order['id']}")
+                allergy_warnings_found = parsed.allergy_warnings or []
+                allergy_confirmed = any(word in clean_message.lower() for word in [
+                    "yes", "confirm", "go ahead", "place it", "order anyway",
+                    "i know", "i understand", "proceed", "ok", "okay", "sure",
+                    "i'll take the risk", "still want", "still order"
+                ])
+
+                if allergy_warnings_found and not allergy_confirmed:
+                    warnings_text = "\n".join([f"⚠️ {w}" for w in allergy_warnings_found])
+                    result["reply"] = (
+                        f"Before I place this order, I need to let you know:\n\n"
+                        f"{warnings_text}\n\n"
+                        f"Based on your allergy profile, some items may not be safe for you.\n\n"
+                        f"💡 You can also place the order and send a **modification request** "
+                        f"(e.g. \"no cheese\") and the kitchen will confirm if they can accommodate it.\n\n"
+                        f"Reply **\"confirm\"** to place the order anyway, or tell me what you'd like to change."
+                    )
+                    result["order_placed"] = False
+                    result["allergy_gate"] = True
+                else:
+                    daily_number = await get_next_order_number(db, restaurant_id)
+                    order_data = {
+                        "restaurant_id": restaurant_id,
+                        "user_id": user_id,
+                        "customer_name": customer_name,
+                        "table_number": req.table_number,
+                        "items": _json.dumps([i.model_dump() for i in parsed.items]),
+                        "price": parsed.total,
+                        "status": "pending",
+                        "cancellation_status": "none",
+                        "modification_status": "none",
+                        "allergy_warnings": allergy_warnings_found,
+                        "daily_order_number": daily_number,
+                    }
+                    order_result = db.table("orders").insert(order_data).execute()
+                    order = order_result.data[0]
+                    await manager.broadcast_to_kitchen(restaurant_id, "new_order", {
+                        "order_id": order["id"],
+                        "order_number": daily_number,
+                        "table_number": req.table_number,
+                        "customer_name": customer_name,
+                        "items": [i.model_dump() for i in parsed.items],
+                        "total": parsed.total,
+                        "allergy_warnings": allergy_warnings_found,
+                    })
+                    result["order_placed"] = True
+                    result["order_id"] = order["id"]
+                    result["order_total"] = parsed.total
+                    result["order_number"] = daily_number
+                    logger.info(f"Order #{daily_number} placed: {order['id']}")
             else:
                 logger.info(f"No items parsed — unrecognized: {parsed.unrecognized_items}")
         except Exception as e:
             logger.warning(f"Auto-order failed: {e}")
 
-    # ── Auto-create booking when AI says "I'll book that for you now" ─────
-    # ── Auto-create booking when AI confirms ──────────────────────────────
     reply_lower = result.get("reply", "").lower()
     logger.info(f"Booking trigger — mode={result.get('new_mode')} reply='{result.get('reply','')[:80]}'")
 
@@ -1808,8 +2042,8 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
     should_attempt_booking = (
         result.get("new_mode") == "booking"
         and any(phrase in reply_lower for phrase in booking_trigger_phrases)
-        and not result.get("booking_placed")        # never try twice in one request
-        and not result.get("booking_error")         # don't retry after an error
+        and not result.get("booking_placed")
+        and not result.get("booking_error")
     )
 
     if should_attempt_booking:
@@ -1822,10 +2056,7 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
             DUBAI_TZ = _ZI("Asia/Dubai")
             now_dubai = _dt.now(DUBAI_TZ)
 
-            # ── Parse party size from conversation ────────────────────────
-            # Use only current reply + current message — NOT full history
-            # Full history causes old bookings to bleed into the parser
-            parse_source = result.get("reply", "") + " " + req.message
+            parse_source = result.get("reply", "") + " " + clean_message
             parse_lower = parse_source.lower()
 
             party_size = 2
@@ -1839,7 +2070,6 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                     if 1 <= party_size <= 20:
                         break
 
-            # ── Parse time from current reply ─────────────────────────────
             hour, minute = 19, 0
             tm = _re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b', parse_lower)
             if tm:
@@ -1850,8 +2080,6 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                 elif tm.group(3) == "am" and hour == 12:
                     hour = 0
 
-            # ── Parse date ONLY from current AI reply (not history) ───────
-            # This is the critical fix — history contains old dates that bleed in
             date_source = result.get("reply", "")
             booking_date = None
 
@@ -1877,21 +2105,17 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
 
             ds = date_source.lower()
 
-            # Pattern 1: "Month Day, Year" or "Month Day Year" e.g. "July 5 2026"
             matches = _re.findall(
                 r'\b(january|february|march|april|may|june|july|august|september|'
                 r'october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)'
                 r'\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})\b', ds
             )
             if matches:
-                # Take the LAST match — AI states the booking date last
-                # e.g. "Today is April 9... I'll book April 11" → take April 11
                 last = matches[-1]
                 d = try_date(int(last[2]), MONTHS[last[0]], int(last[1]))
                 if d:
                     booking_date = d
 
-            # Pattern 2: "Day Month Year" e.g. "5 July 2026" or "5th July 2026"
             if not booking_date:
                 matches2 = _re.findall(
                     r'\b(\d{1,2})(?:st|nd|rd|th)?\s+'
@@ -1905,7 +2129,6 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                     if d:
                         booking_date = d
 
-            # Pattern 3: "Month Day" no year — pick nearest future occurrence
             if not booking_date:
                 matches3 = _re.findall(
                     r'\b(january|february|march|april|may|june|july|august|september|'
@@ -1920,7 +2143,6 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                             booking_date = d
                             break
 
-            # Pattern 4: "Day Month" no year
             if not booking_date:
                 m = _re.search(
                     r'\b(\d{1,2})(?:st|nd|rd|th)?\s+'
@@ -1935,8 +2157,7 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                             booking_date = d
                             break
 
-            # Pattern 5: relative keywords — only from user message not AI reply
-            user_msg_lower = req.message.lower()
+            user_msg_lower = clean_message.lower()
             if not booking_date:
                 if "today" in user_msg_lower:
                     booking_date = now_dubai.date()
@@ -1955,10 +2176,7 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
 
             if not booking_date:
                 logger.warning("Could not parse booking date from AI reply")
-                result["reply"] += (
-                    "\n\n⚠️ I couldn't determine the date. "
-                    "Please use the Book tab to confirm your reservation."
-                )
+                result["reply"] += "\n\n⚠️ I couldn't determine the date. Please use the Book tab to confirm your reservation."
                 result["booking_error"] = True
                 return result
 
@@ -1969,7 +2187,6 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                 hour, minute, 0, tzinfo=DUBAI_TZ
             )
 
-            # ── Validate time ─────────────────────────────────────────────
             valid, err = validate_booking_time(booking_dt)
             if not valid:
                 result["reply"] = (
@@ -1980,47 +2197,37 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
                 result["booking_error"] = True
                 return result
 
-            # ── Fetch existing bookings for this user only ────────────────
             user_bookings = db.table("bookings").select("*").eq(
                 "restaurant_id", restaurant_id
             ).eq("user_id", user_id).execute()
 
-            # ── Duplicate check: same user, ±2hr window, active only ──────
             is_dup = check_duplicate_booking(user_bookings.data, user_id, booking_dt)
             logger.info(f"Duplicate check: is_dup={is_dup} for {booking_dt.isoformat()}")
 
             if is_dup:
                 result["reply"] = (
                     f"You already have a booking close to that time. "
-                    f"Please choose a time at least 2 hours apart from your existing booking, "
-                    f"or cancel it from the Book tab first."
+                    f"Please choose a time at least 2 hours apart, or cancel it from the Book tab first."
                 )
                 result["booking_placed"] = False
                 result["booking_error"] = True
                 return result
 
-            # ── Capacity check across all restaurant bookings ─────────────
-            all_bookings = db.table("bookings").select("*").eq(
+            all_bookings = db.table("bookings").select("*").eq("restaurant_id", restaurant_id).execute()
+
+            pol = db.table("restaurant_policies").select("table_count, max_party_size").eq(
                 "restaurant_id", restaurant_id
             ).execute()
-
-            pol = db.table("restaurant_policies").select(
-                "table_count, max_party_size"
-            ).eq("restaurant_id", restaurant_id).execute()
             tc = (pol.data[0].get("table_count") or 20) if pol.data else 20
             mp = (pol.data[0].get("max_party_size") or 10) if pol.data else 10
 
             cap_ok, cap_err = check_capacity(all_bookings.data, booking_dt, party_size, tc, mp)
             if not cap_ok:
-                result["reply"] = (
-                    f"Sorry, no tables available at that time — {cap_err}\n\n"
-                    f"Please choose a different time."
-                )
+                result["reply"] = f"Sorry, no tables available at that time — {cap_err}\n\nPlease choose a different time."
                 result["booking_placed"] = False
                 result["booking_error"] = True
                 return result
 
-            # ── Create the booking ────────────────────────────────────────
             bk = db.table("bookings").insert({
                 "restaurant_id": restaurant_id,
                 "user_id": user_id,
@@ -2031,14 +2238,12 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
             }).execute()
 
             if bk.data:
-                # Format date/time from the actual booking_dt — single source of truth
-                time_str = booking_dt.strftime("%-I:%M %p") if hasattr(booking_dt, 'strftime') else booking_dt.strftime("%I:%M %p").lstrip("0")
+                time_str = booking_dt.strftime("%-I:%M %p")
                 date_str = booking_dt.strftime("%A %d %B %Y")
                 summary = f"{party_size} people · {date_str} · {time_str}"
                 result["booking_placed"] = True
                 result["booking_id"] = bk.data[0]["id"]
                 result["booking_summary"] = summary
-                # Include ISO string so frontend can format it correctly
                 result["booking_datetime_iso"] = booking_dt.isoformat()
                 logger.info(f"Booking created: {booking_dt.isoformat()} for {party_size} people")
             else:
@@ -2051,6 +2256,7 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
 
     return result
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # QR CODE GENERATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2059,18 +2265,14 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
 async def get_qr_code(
     restaurant_id: str,
     table: Optional[str] = None,
-    format: str = "png",          # png or html (html shows download page)
+    format: str = "png",
 ):
-    """
-    Generate a QR code for a specific restaurant (and optionally a table).
-    Scan → opens customer login with restaurant_id + table pre-filled.
-    """
-    base_url = settings.allowed_origins.split(",")[0].strip()  # first origin = frontend URL
+    """Generate a QR code for a specific restaurant (and optionally a table)."""
+    base_url = settings.allowed_origins.split(",")[0].strip()
     url = f"{base_url}/customer/login?restaurant={restaurant_id}"
     if table:
         url += f"&table={table}"
 
-    # Generate QR image
     qr = qrcode.QRCode(version=1, box_size=10, border=4)
     qr.add_data(url)
     qr.make(fit=True)
@@ -2081,7 +2283,6 @@ async def get_qr_code(
     buf.seek(0)
 
     if format == "html":
-        # Returns a simple HTML page staff can print
         import base64
         img_b64 = base64.b64encode(buf.getvalue()).decode()
         label = f"Table {table}" if table else "Restaurant QR"
@@ -2101,21 +2302,22 @@ async def get_qr_code(
     return StreamingResponse(buf, media_type="image/png",
         headers={"Content-Disposition": f"inline; filename=qr_{restaurant_id}.png"})
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # VOICE TRANSCRIPTION (Whisper via Groq)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/transcribe")
 async def transcribe_voice(
+    request: Request,
     audio: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Accepts an audio file (webm/mp4/wav), sends it to Groq Whisper,
-    returns the transcribed text. Frontend pastes this into the chat input.
-    """
+    """Accepts an audio file, sends it to Groq Whisper, returns transcribed text."""
+    rate_limiter.check(request, limit=10, window_seconds=60, scope="transcribe")
     try:
-        client = get_groq()
+        from groq import Groq
+        client = Groq(api_key=settings.groq_api_key)
         audio_bytes = await audio.read()
 
         transcription = client.audio.transcriptions.create(
@@ -2129,25 +2331,55 @@ async def transcribe_voice(
         logger.error(f"Transcription error: {e}")
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WEBSOCKET ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.websocket("/ws/customer/{session_id}")
 async def customer_ws(websocket: WebSocket, session_id: str):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4001, reason="Authentication required.")
+        return
+    try:
+        payload = decode_token(token)
+        if payload.get("user_id") != session_id:
+            await websocket.close(code=4003, reason="Forbidden.")
+            return
+    except Exception:
+        await websocket.close(code=4001, reason="Invalid token.")
+        return
+
     await manager.connect_customer(session_id, websocket)
     try:
         while True:
-            await websocket.receive_text()  # Keep alive
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect_customer(session_id)
 
 
 @app.websocket("/ws/kitchen/{restaurant_id}")
 async def kitchen_ws(websocket: WebSocket, restaurant_id: str):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4001, reason="Authentication required.")
+        return
+    try:
+        payload = decode_token(token)
+        if payload.get("role") not in ("admin", "chef", "manager"):
+            await websocket.close(code=4003, reason="Staff access required.")
+            return
+        if payload.get("restaurant_id") != restaurant_id:
+            await websocket.close(code=4003, reason="Wrong restaurant.")
+            return
+    except Exception:
+        await websocket.close(code=4001, reason="Invalid token.")
+        return
+
     await manager.connect_kitchen(restaurant_id, websocket)
     try:
         while True:
-            await websocket.receive_text()  # Keep alive
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect_kitchen(restaurant_id, websocket)

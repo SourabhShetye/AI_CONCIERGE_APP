@@ -18,20 +18,74 @@ api.interceptors.request.use((config) => {
 
 // On 401, only redirect to home if it's NOT a login attempt
 // Login failures should show an error message, not redirect
-api.interceptors.response.use(
-  (res) => res,
-  (err) => {
-    const isLoginEndpoint =
-      err.config?.url?.includes('/customer/login') ||
-      err.config?.url?.includes('/customer/register') ||
-      err.config?.url?.includes('/staff/login')
+let isRefreshing = false
+let failedQueue: Array<{resolve: Function, reject: Function}> = []
 
-    if (err.response?.status === 401 && !isLoginEndpoint) {
-      sessionStorage.removeItem('token')
-      sessionStorage.removeItem('user')
-      window.location.href = '/'
+const processQueue = (error: any, token: string | null = null) => {
+  failedQueue.forEach(({ resolve, reject }) => {
+    if (error) reject(error)
+    else resolve(token)
+  })
+  failedQueue = []
+}
+
+api.interceptors.response.use(
+  (response) => response,  // Pass through success responses
+  async (error) => {
+    const originalRequest = error.config
+
+    // Only attempt refresh on 401, and only once per request
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      if (isRefreshing) {
+        // Queue requests while refresh is in progress
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject })
+        }).then((token) => {
+          originalRequest.headers.Authorization = `Bearer ${token}`
+          return api(originalRequest)
+        })
+      }
+
+      originalRequest._retry = true
+      isRefreshing = true
+
+      const refreshToken = sessionStorage.getItem('refresh_token')
+      if (!refreshToken) {
+        // No refresh token — force logout
+        sessionStorage.clear()
+        window.location.href = '/customer/login'
+        return Promise.reject(error)
+      }
+
+      try {
+        const response = await axios.post(
+          `${import.meta.env.VITE_API_URL}/api/auth/refresh`,
+          { refresh_token: refreshToken }
+        )
+
+        const { access_token, refresh_token: newRefreshToken } = response.data
+
+        // Store new tokens
+        sessionStorage.setItem('token', access_token)
+        sessionStorage.setItem('refresh_token', newRefreshToken)
+
+        // Retry original request with new token
+        originalRequest.headers.Authorization = `Bearer ${access_token}`
+        processQueue(null, access_token)
+
+        return api(originalRequest)
+      } catch (refreshError) {
+        // Refresh failed — clear session and redirect to login
+        processQueue(refreshError, null)
+        sessionStorage.clear()
+        window.location.href = '/customer/login'
+        return Promise.reject(refreshError)
+      } finally {
+        isRefreshing = false
+      }
     }
-    return Promise.reject(err)
+
+    return Promise.reject(error)
   }
 )
 
@@ -40,7 +94,8 @@ api.interceptors.response.use(
 export const authApi = {
   customerRegister: (data: {
     name: string; pin: string; phone?: string;
-    restaurant_id?: string; table_number?: string; allergies?: string[]
+    restaurant_id?: string; table_number?: string; allergies?: string[];
+    health_data_consent?: boolean; terms_accepted?: boolean;
   }) => api.post('/api/customer/register', data),
 
   customerLogin: (data: {

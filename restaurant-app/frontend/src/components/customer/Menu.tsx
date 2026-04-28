@@ -123,24 +123,6 @@ export default function Menu() {
         />
       </div>
 
-      {/* AI Natural Language Input */}
-      <div className="card border-primary-100 bg-gradient-to-br from-primary-50 to-white">
-        <p className="text-sm font-semibold text-primary-700 mb-2">🤖 Order with AI</p>
-        <p className="text-xs text-gray-500 mb-3">Just describe what you want in plain English</p>
-        <div className="flex gap-2">
-          <input
-            className="input flex-1"
-            placeholder='"I want 2 burgers and a coffee"'
-            value={nlInput}
-            onChange={(e) => setNlInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleNLOrder()}
-          />
-          <button onClick={handleNLOrder} disabled={ordering} className="btn-primary px-4">
-            {ordering ? '...' : <Send size={18} />}
-          </button>
-        </div>
-      </div>
-
       {/* Order result (allergy warnings / unrecognized items) */}
       {orderResult && (
         <div className="card border-green-200 bg-green-50">

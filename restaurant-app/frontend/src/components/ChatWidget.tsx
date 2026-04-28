@@ -54,6 +54,8 @@ export default function ChatWidget() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [recording, setRecording] = useState(false)
+  const [awaitingTable, setAwaitingTable] = useState(false)
+  const [tableInput, setTableInput] = useState('')
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -80,6 +82,20 @@ export default function ChatWidget() {
       setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'instant' }), 50)
     }
   }, [open])
+
+  // Reset chat when user changes (prevents previous customer's chat showing)
+  const prevUserIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    const currentUserId = user?.user_id || null
+    if (prevUserIdRef.current !== null && prevUserIdRef.current !== currentUserId) {
+      // User changed — clear all chat state
+      sessionStorage.removeItem('chat_messages')
+      sessionStorage.removeItem('chat_state')
+      setMessages([{ role: 'assistant', content: 'Hi! How can I help you today?', timestamp: new Date() }])
+      setChatState(DEFAULT_STATE)
+    }
+    prevUserIdRef.current = currentUserId
+  }, [user?.user_id])
 
   // Kitchen notification handler
   useEffect(() => {
@@ -141,12 +157,17 @@ export default function ChatWidget() {
   const sendMessage = async () => {
     if (!input.trim() || loading) return
 
+    if (input.length > 2000) {
+      addMessage('assistant', 'Message too long. Please keep it under 2000 characters.')
+      return
+    }
+
     let tableNumber = user ? sessionStorage.getItem(`table_${user.user_id}`) : null
     if (!tableNumber && chatState.mode === 'ordering') {
-      const tbl = window.prompt('Please enter your table number before ordering:')
-      if (!tbl) return
-      if (user) sessionStorage.setItem(`table_${user.user_id}`, tbl)
-      tableNumber = tbl
+      // Show inline prompt instead of browser dialog
+      setAwaitingTable(true)
+      setInput('')
+      return
     }
 
     const sentInput = input
@@ -192,7 +213,17 @@ export default function ChatWidget() {
 
     } catch (err: any) {
       const detail = err.response?.data?.detail
-      addMessage('assistant', typeof detail === 'string' ? `Error: ${detail}` : 'Sorry, something went wrong.')
+      const status = err.response?.status
+      if (status === 503 || (typeof detail === 'string' && detail.includes('unavailable'))) {
+        addMessage(
+          'assistant',
+          '🔧 Our AI assistant is temporarily unavailable. Please use the menu to order directly, or ask a staff member for help.'
+        )
+      } else if (status === 429) {
+        addMessage('assistant', '⏱️ Too many messages. Please wait a moment before sending another.')
+      } else {
+        addMessage('assistant', typeof detail === 'string' ? `Error: ${detail}` : 'Sorry, something went wrong. Please try again.')
+      }
       setChatState(DEFAULT_STATE)
     } finally {
       setLoading(false)
@@ -330,6 +361,48 @@ export default function ChatWidget() {
               )}
               <div ref={bottomRef} />
             </div>
+
+            {/* Inline table number prompt */}
+            {awaitingTable && (
+              <div className="px-4 pb-3 pt-3 bg-amber-50 border-t border-amber-200 flex-shrink-0">
+                <p className="text-xs text-amber-700 font-medium mb-2">
+                  📍 What is your table number?
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    className="input flex-1 text-sm"
+                    placeholder="e.g. 5"
+                    value={tableInput}
+                    onChange={e => setTableInput(e.target.value.replace(/\D/g, ''))}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && tableInput.trim()) {
+                        if (user) sessionStorage.setItem(`table_${user.user_id}`, tableInput.trim())
+                        setAwaitingTable(false)
+                        setTableInput('')
+                      }
+                    }}
+                    autoFocus
+                  />
+                  <button
+                    onClick={() => {
+                      if (!tableInput.trim()) return
+                      if (user) sessionStorage.setItem(`table_${user.user_id}`, tableInput.trim())
+                      setAwaitingTable(false)
+                      setTableInput('')
+                    }}
+                    className="btn-primary px-3 py-2 text-sm flex-shrink-0"
+                  >
+                    Confirm
+                  </button>
+                  <button
+                    onClick={() => { setAwaitingTable(false); setTableInput('') }}
+                    className="text-xs text-gray-400 hover:text-gray-600 px-2"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Input */}
             <div className="p-4 border-t border-gray-100 flex gap-2 flex-shrink-0">

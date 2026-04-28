@@ -10,6 +10,7 @@ import MyOrders from './MyOrders'
 import Bill from './Bill'
 import Feedback from './Feedback'
 import { useState } from 'react'
+import ChatWidget from '@/components/ChatWidget'
 
 const TABS = [
   { path: '/customer/menu',     label: 'Order',    icon: UtensilsCrossed },
@@ -139,6 +140,7 @@ export default function CustomerApp() {
           )
         })}
       </nav>
+      <ChatWidget />
     </div>
   )
 }

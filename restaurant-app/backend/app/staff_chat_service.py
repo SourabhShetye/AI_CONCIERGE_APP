@@ -80,14 +80,19 @@ def format_menu_for_context(menu: list[dict]) -> str:
     return "\n".join(lines) if lines else "No menu items."
 
 
-def format_customers_for_context(customers: list[dict]) -> str:
-    if not customers:
-        return "No customers."
+def format_customers_for_context(customers: list[dict], active_orders: list[dict]) -> str:
+    # Build a set of user_ids who have ACTIVE orders right now
+    # This is the ground truth for "currently seated"
+    actively_ordering = {o.get("user_id") for o in active_orders if o.get("user_id")}
+    
     lines = []
     for c in customers:
+        # Only show as "seated" if they have an active order right now
+        is_seated = c.get("table_number") and c["id"] in actively_ordering
+        table_display = f"Table {c['table_number']}" if is_seated else "not currently seated"
         tags = ", ".join(c.get("tags") or []) or "none"
         lines.append(
-            f"{c.get('name','?')} | Table: {c.get('table_number') or 'not seated'} "
+            f"{c.get('name','?')} | {table_display} "
             f"| Visits: {c.get('visit_count',0)} | Spend: AED {float(c.get('total_spend',0)):.2f} "
             f"| Tags: {tags}"
         )
@@ -118,7 +123,7 @@ async def process_staff_chat(
     orders_context = format_orders_for_context(active_orders)
     bookings_context = format_bookings_for_context(bookings)
     menu_context = format_menu_for_context(menu)
-    customers_context = format_customers_for_context(customers)
+    customers_context = format_customers_for_context(customers, active_orders)
 
     # Identify delayed orders (>20 min in pending/preparing)
     delayed = []
@@ -159,7 +164,7 @@ async def process_staff_chat(
         if c.get("table_number")
         and any(t in (c.get("tags") or []) for t in ["VIP", "Big Spender", "Brand Ambassador"])
     ]
-    priority_context = format_customers_for_context(priority) if priority else "None currently seated"
+    priority_context = format_customers_for_context(priority, active_orders) if priority else "None currently seated"
 
     # ── Detect if staff wants to send a message to a customer ────────────────
     send_msg_intent = any(phrase in message.lower() for phrase in [
@@ -203,9 +208,13 @@ YOUR CAPABILITIES:
 1. Answer operational questions about orders, bookings, customers, menu
 2. Identify delays, priority customers, busy periods
 3. Give revenue insights (total active table revenue, ARPU)
-4. To send a message to a specific table: respond with exactly this format at the END of your reply:
-   SEND_TO_TABLE:[table_number]:[message to customer]
-   Example: SEND_TO_TABLE:5:The kitchen will be closing in 30 minutes. Would you like to place any final orders?
+4. - ONLY append SEND_TO_TABLE if the staff member EXPLICITLY asks you to send a message to a customer.
+    Keywords that indicate explicit intent: "send", "message", "tell", "notify", "inform" followed by "table".
+    If staff is just asking about a table or customer for information, NEVER append SEND_TO_TABLE.
+    Format: SEND_TO_TABLE:[table_number]:[message]
+    Example trigger: "send table 5 a message that kitchen is closing"
+    Counter-example (do NOT send): "who is at table 5?" or "analyze table 1 customer"
+    Example: SEND_TO_TABLE:5:The kitchen will be closing in 30 minutes. Would you like to place any final orders?
 
 RULES:
 - Be concise and operational — staff are busy

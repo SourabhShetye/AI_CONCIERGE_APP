@@ -27,6 +27,8 @@ export default function CustomerLogin() {
   const [phone, setPhone] = useState('')
   const [tableNumber, setTableNumber] = useState(qrTable)
   const [allergies, setAllergies] = useState<string[]>([])
+  const [termsAccepted, setTermsAccepted] = useState(false)
+  const [healthDataConsent, setHealthDataConsent] = useState(false)
   const [showPin, setShowPin] = useState(false)
   const [loading, setLoading] = useState(false)
 
@@ -37,6 +39,7 @@ export default function CustomerLogin() {
     if (!name.trim()) return toast.error('Please enter your name.')
     if (pin.length !== 4) return toast.error('PIN must be exactly 4 digits.')
     if (mode === 'register' && pin !== confirmPin) return toast.error('PINs do not match.')
+    if (mode === 'register' && !termsAccepted) return toast.error('You must accept the Terms of Service to register.')  
     if (!tableNumber.trim()) return toast.error('Please enter your table number.')
 
     sessionStorage.clear()  // always start fresh — prevents stale staff tokens bleeding in
@@ -45,7 +48,13 @@ export default function CustomerLogin() {
       const payload = { name: name.trim(), pin, restaurant_id: restaurantId, table_number: tableNumber || undefined }
       const res = mode === 'login'
         ? await authApi.customerLogin(payload)
-        : await authApi.customerRegister({ ...payload, phone: phone || undefined, allergies })
+        : await authApi.customerRegister({
+            ...payload,
+            phone: phone || undefined,
+            allergies: healthDataConsent ? allergies : [],
+            health_data_consent: healthDataConsent,
+            terms_accepted: termsAccepted,
+          })
 
       const user: AuthUser = { ...res.data, role: 'customer' }
       login(user)
@@ -196,6 +205,38 @@ export default function CustomerLogin() {
                 ))}
               </div>
             </div>
+          )}
+
+          {/* GDPR consent checkboxes — register only */}
+          {mode === 'register' && (
+            <>
+              <div className="flex items-start gap-2 mt-3">
+                <input
+                  type="checkbox"
+                  id="terms"
+                  checked={termsAccepted}
+                  onChange={(e) => setTermsAccepted(e.target.checked)}
+                  className="mt-1 flex-shrink-0"
+                />
+                <label htmlFor="terms" className="text-xs text-gray-600 leading-relaxed">
+                  I accept the Privacy Policy and Terms of Service. I understand that my
+                  name, table number, and order history will be stored. <span className="text-red-500">*</span>
+                </label>
+              </div>
+              <div className="flex items-start gap-2 mt-2">
+                <input
+                  type="checkbox"
+                  id="healthConsent"
+                  checked={healthDataConsent}
+                  onChange={(e) => setHealthDataConsent(e.target.checked)}
+                  className="mt-1 flex-shrink-0"
+                />
+                <label htmlFor="healthConsent" className="text-xs text-gray-600 leading-relaxed">
+                  I consent to storing my dietary restrictions and allergy information
+                  for allergy warnings during ordering. <span className="text-gray-400">(Optional)</span>
+                </label>
+              </div>
+            </>
           )}
 
           <button

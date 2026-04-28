@@ -81,20 +81,78 @@ def detect_allergens_in_text(text: str) -> list[str]:
             found.append(allergen)
     return found
 
+# ── Natural language allergy declaration patterns ─────────────────────────────
+ALLERGY_DECLARATION_PATTERNS = [
+    (r"allerg(?:ic|y|ies)\s+to\s+([\w\s,]+)",                "direct_allergy"),
+    (r"have\s+(?:a\s+)?(?:severe\s+)?(\w+)\s+allerg",        "has_allergy"),
+    (r"can(?:\'t|not)\s+(?:eat|have|consume)\s+([\w\s,]+)",  "cannot_eat"),
+    (r"(?:please\s+)?avoid\s+([\w\s,]+)",                    "avoid"),
+    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?vegan",                 "vegan"),
+    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?vegetarian",            "vegetarian"),
+    (r"\bvegetarian\b",                                       "vegetarian"),
+    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?lactose[- ]intolerant", "lactose_intolerant"),
+    (r"lactose[- ]intolerant",                                "lactose_intolerant"),
+    (r"(?:gluten[- ]free|no\s+gluten)",                      "gluten_free"),
+    (r"(?:nut[- ]free|no\s+nuts?|peanut[- ]free|no\s+peanuts?)", "nut_free"),
+    (r"(?:dairy[- ]free|no\s+dairy|avoid\s+dairy)",          "dairy_free"),
+    (r"(?:no\s+(?:shellfish|shrimp|prawns?|lobster|crab))",  "shellfish_free"),
+    (r"kosher",                                               "kosher"),
+    (r"halal",                                                "halal"),
+]
+
+ALLERGEN_KEYWORD_MAP = {
+    "nut": "nuts", "peanut": "nuts", "almond": "nuts", "cashew": "nuts",
+    "dairy": "dairy", "milk": "dairy", "cheese": "dairy", "lactose": "dairy", "butter": "dairy",
+    "gluten": "gluten", "wheat": "gluten", "bread": "gluten",
+    "egg": "eggs", "eggs": "eggs",
+    "shellfish": "shellfish", "shrimp": "shellfish", "prawn": "shellfish",
+    "fish": "fish", "salmon": "fish",
+    "soy": "soy",
+}
+
+TAG_TO_ALLERGEN = {
+    "vegan":             "vegan",
+    "vegetarian":        "vegetarian",
+    "lactose_intolerant": "dairy",
+    "gluten_free":       "gluten",
+    "nut_free":          "nuts",
+    "dairy_free":        "dairy",
+    "shellfish_free":    "shellfish",
+    "kosher":            "kosher",
+    "halal":             "halal",
+}
+
 
 def detect_allergy_declarations(message: str) -> list[str]:
     """
-    Detect how a CUSTOMER declares their allergies in natural language chat.
-    Used when a customer says things like:
-      "I have a nut allergy", "I'm vegan", "please avoid dairy"
-    Returns list of detected dietary tags.
-    Distinct from detect_allergens_in_text() which scans menu item text.
+    Detects how a customer declares allergies in natural language.
+    Returns actual allergen names (e.g. 'nuts', 'dairy'), NOT tag categories.
+    Used when updating user_sessions.allergies column.
     """
     msg_lower = message.lower()
     detected = []
+
     for pattern, tag in ALLERGY_DECLARATION_PATTERNS:
-        if re.search(pattern, msg_lower):
-            detected.append(tag)
+        m = re.search(pattern, msg_lower)
+        if not m:
+            continue
+        allergen = TAG_TO_ALLERGEN.get(tag)
+        if allergen:
+            detected.append(allergen)
+        elif tag in ("direct_allergy", "has_allergy", "cannot_eat", "avoid"):
+            try:
+                extracted = m.group(1).strip().rstrip(".,;")
+                matched = False
+                for keyword, allergen_name in ALLERGEN_KEYWORD_MAP.items():
+                    if keyword in extracted:
+                        detected.append(allergen_name)
+                        matched = True
+                        break
+                if not matched and len(extracted) > 2:
+                    detected.append(extracted)
+            except IndexError:
+                pass
+
     return list(set(detected))
 
 

@@ -8,6 +8,7 @@ export interface AuthUser {
   role: 'customer' | StaffRole
   restaurant_id: string
   access_token: string
+  refresh_token?: string
   visit_count?: number
   total_spend?: number
   tags?: string[]

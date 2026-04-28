@@ -325,11 +325,22 @@ export default function SettingsPanel() {
         <p className="text-xs text-gray-500">
           Injected into every customer AI prompt. Use for specials, restrictions, or custom instructions.
         </p>
-        <textarea
-          className="input resize-none h-28"
-          placeholder="e.g. Today's special: Grilled Salmon 20% off. We are fully booked on Friday evening."
-          {...f('ai_context')}
-        />
+        <div className="relative">
+          <textarea
+            className="input resize-none h-28"
+            placeholder="e.g. Today's special: Grilled Salmon 20% off. We are fully booked on Friday evening."
+            maxLength={1000}
+            value={form.ai_context}
+            onChange={(e) => setForm({ ...form, ai_context: e.target.value })}
+          />
+          <span className="absolute bottom-2 right-2 text-xs text-gray-400">
+            {(form.ai_context || '').length}/1000
+          </span>
+        </div>
+        <p className="text-xs text-orange-500 mt-1">
+          ⚠️ Only factual content allowed (specials, hours, policies).
+          Do not include instructions to override AI behaviour.
+        </p>
       </div>
 
       {/* ── QR Codes ─────────────────────────────────────────────────────── */}
