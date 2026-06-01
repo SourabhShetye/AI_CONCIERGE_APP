@@ -4,9 +4,10 @@
   "version": "2.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "node ./node_modules/typescript/bin/tsc --noEmit && node ./node_modules/vite/dist/node/cli.js build",
-    "preview": "vite preview"
+    "dev": "npm exec vite",
+    "build": "npm exec tsc --noEmit && npm exec vite build",
+    "vercel-build": "npm exec tsc --noEmit && npm exec vite build",
+    "preview": "npm exec vite preview"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.0.5",
