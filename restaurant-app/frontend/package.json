@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node ./node_modules/vite/dist/node/cli.js",
     "build": "node ./node_modules/typescript/bin/tsc --noEmit && node ./node_modules/vite/dist/node/cli.js build",
-    "vercel-build": "node ./node_modules/typescript/bin/tsc --noEmit && node ./node_modules/vite/dist/node/cli.js build",
+    "vercel-build": "node -e \"const fs=require('fs');fs.rmSync('node_modules',{recursive:true,force:true});\" && npm ci && node ./node_modules/typescript/bin/tsc --noEmit && node ./node_modules/vite/dist/node/cli.js build",
     "preview": "node ./node_modules/vite/dist/node/cli.js preview"
   },
   "dependencies": {
