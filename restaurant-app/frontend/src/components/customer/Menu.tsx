@@ -17,6 +17,8 @@ export default function Menu() {
   const [ordering, setOrdering] = useState(false)
   const [orderResult, setOrderResult] = useState<PlaceOrderResponse | null>(null)
   const [showCart, setShowCart] = useState(false)
+  const [awaitingTable, setAwaitingTable] = useState(false)
+  const [tableInput, setTableInput] = useState('')
   const { cart, addItem, removeItem, updateQty, clearCart, total, itemCount } = useCart()
 
   const { user } = useAuth()
@@ -47,16 +49,14 @@ export default function Menu() {
   // Natural language order submission
   const handleNLOrder = async () => {
     if (!nlInput.trim()) return toast.error('Please describe your order.')
-    const tableNumber = user ? sessionStorage.getItem(`table_${user.user_id}`) || '' : ''
+    const tableNumber = user ? sessionStorage.getItem(`table_${user.user_id}`) : null
 
     if (!tableNumber) {
-      // Ask for table number
-      const tbl = window.prompt('Please enter your table number:')
-      if (!tbl) return
-      if (user) sessionStorage.setItem(`table_${user.user_id}`, tbl)
+      setAwaitingTable(true)
+      return
     }
 
-    const tbl = sessionStorage.getItem(`table_${user?.user_id}`) || ''
+    const tbl = tableNumber || ''
     setOrdering(true)
     try {
       const res = await orderApi.placeOrder({
@@ -82,13 +82,12 @@ export default function Menu() {
   // Cart-based order
   const handleCartOrder = async () => {
     if (!cart.length) return
-    const tableNumber = sessionStorage.getItem(`table_${user?.user_id}`) || ''
+    const tableNumber = user ? sessionStorage.getItem(`table_${user.user_id}`) : null
     if (!tableNumber) {
-      const tbl = window.prompt('Please enter your table number:')
-      if (!tbl) return
-      if (user) sessionStorage.setItem(`table_${user.user_id}`, tbl)
+      setAwaitingTable(true)
+      return
     }
-    const tbl = sessionStorage.getItem(`table_${user?.user_id}`) || ''
+    const tbl = tableNumber || ''
     const nlText = cart.map((e) => `${e.quantity} ${e.item.name}`).join(', ')
     setOrdering(true)
     try {
@@ -256,8 +255,31 @@ export default function Menu() {
             <div className="flex justify-between font-bold text-lg mt-4 mb-6">
               <span>Total</span>
               <span>AED {total.toFixed(2)}</span>
-            </div>
-            <button onClick={handleCartOrder} disabled={ordering} className="btn-primary w-full">
+            </div>            {awaitingTable && (
+              <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl mb-4">
+                <p className="text-xs text-amber-700 font-medium mb-2">📍 Enter your table number to place order</p>
+                <div className="flex gap-2">
+                  <input
+                    className="input flex-1 text-sm"
+                    placeholder="e.g. 5"
+                    value={tableInput}
+                    onChange={(e) => setTableInput(e.target.value.replace(/\D/g, ''))}
+                    autoFocus
+                  />
+                  <button
+                    onClick={() => {
+                      if (!tableInput.trim()) return
+                      if (user) sessionStorage.setItem(`table_${user.user_id}`, tableInput.trim())
+                      setAwaitingTable(false)
+                      setTableInput('')
+                    }}
+                    className="btn-primary px-3 py-2 text-sm"
+                  >
+                    Confirm
+                  </button>
+                </div>
+              </div>
+            )}            <button onClick={handleCartOrder} disabled={ordering} className="btn-primary w-full">
               {ordering ? 'Placing Order...' : 'Place Order 🍳'}
             </button>
           </div>
