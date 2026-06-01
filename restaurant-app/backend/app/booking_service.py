@@ -131,6 +131,8 @@ def find_best_table(
     tables: list[dict],
     party_size: int,
     booked_table_ids: set[str],
+    availability_rules=None,
+    booking_time=None,
 ) -> Optional[dict]:
     """
     Bin-packing: find the smallest available table that fits the party.
@@ -223,5 +225,26 @@ def check_capacity(
 
     if conflicting >= total_tables:
         return False, "No tables available for that time slot. Please choose a different time."
+
+    return True, ""
+
+def is_restaurant_open_for_booking(
+    booking_time: datetime,
+    blackout_dates: list[dict],
+) -> tuple[bool, str]:
+    """
+    Check if the restaurant is open for bookings on the requested date.
+    Returns (True, "") if open, (False, reason) if blocked.
+    """
+    booking_date_str = booking_time.strftime("%Y-%m-%d")
+
+    for bd in blackout_dates:
+        bd_date = bd.get("blackout_date", "")
+        # Handle both date string and datetime string formats
+        if isinstance(bd_date, str):
+            bd_date = bd_date[:10]  # take only YYYY-MM-DD portion
+        if bd_date == booking_date_str:
+            reason = bd.get("reason", "The restaurant is closed on this date.")
+            return False, f"Sorry, we're closed on {booking_time.strftime('%d %B %Y')}: {reason}"
 
     return True, ""

@@ -47,26 +47,6 @@ ALLERGEN_PATTERNS = {
 }
 
 # ── Natural language allergy declaration patterns ──────────────────────────
-# These detect how customers DESCRIBE their allergies/dietary needs in chat.
-# Distinct from ALLERGEN_PATTERNS which scans menu item names/descriptions.
-ALLERGY_DECLARATION_PATTERNS = [
-    (r"allerg(?:ic|y|ies)\s+to\s+([\w\s,]+)",                "direct_allergy"),
-    (r"have\s+(?:a\s+)?(?:severe\s+)?(\w+)\s+allerg",        "has_allergy"),
-    (r"can(?:\'t|not)\s+(?:eat|have|consume)\s+([\w\s,]+)",  "cannot_eat"),
-    (r"(?:please\s+)?avoid\s+([\w\s,]+)",                    "avoid"),
-    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?vegan",                 "vegan"),
-    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?vegetarian",            "vegetarian"),
-    (r"\bvegetarian\b",                                       "vegetarian"),
-    (r"(?:i'?m?|am|i am)\s+(?:a\s+)?lactose[- ]intolerant", "lactose_intolerant"),
-    (r"lactose[- ]intolerant",                                "lactose_intolerant"),
-    (r"(?:gluten[- ]free|no\s+gluten)",                      "gluten_free"),
-    (r"(?:nut[- ]free|no\s+nuts?|peanut[- ]free|no\s+peanuts?)", "nut_free"),
-    (r"(?:dairy[- ]free|no\s+dairy|avoid\s+dairy)",          "dairy_free"),
-    (r"(?:no\s+(?:shellfish|shrimp|prawns?|lobster|crab))",  "shellfish_free"),
-    (r"kosher",                                               "kosher"),
-    (r"halal",                                                "halal"),
-]
-
 
 def detect_allergens_in_text(text: str) -> list[str]:
     """
@@ -161,30 +141,45 @@ def check_allergy_warnings(
     customer_allergies: list[str],
     menu_items: list[dict],
 ) -> list[str]:
-    """
-    Cross-reference ordered items against customer's stated allergies.
-    Returns human-readable warning strings.
-    """
     if not customer_allergies:
         return []
 
     warnings = []
+    seen_dishes = set()  # track which dish names already have a warning
     menu_map = {item["name"].lower(): item for item in menu_items}
 
     for order_item in items:
+        # Skip if we already warned about this dish (handles duplicate quantities)
+        if order_item.name.lower() in seen_dishes:
+            continue
+
         menu_entry = menu_map.get(order_item.name.lower())
         if not menu_entry:
             continue
 
-        allergens_in_item = menu_entry.get("allergens", []) or detect_allergens_in_text(
+        # Use the allergens column first — fall back to text scan only if empty
+        allergens_in_item = menu_entry.get("allergens") or detect_allergens_in_text(
             f"{menu_entry.get('name','')} {menu_entry.get('description','')}"
         )
 
-        for customer_allergy in customer_allergies:
-            if customer_allergy.lower() in [a.lower() for a in allergens_in_item]:
-                warnings.append(
-                    f"⚠️ {order_item.name} contains {customer_allergy} (allergy on file)"
-                )
+        # Normalise to lowercase for comparison
+        allergens_lower = [a.lower() for a in allergens_in_item]
+        customer_allergies_lower = [a.lower() for a in customer_allergies]
+
+        # Find matching allergens for this dish
+        matched = [
+            a for a in allergens_lower
+            if a in customer_allergies_lower
+        ]
+
+        if matched:
+            # One warning per dish, listing all matched allergens
+            allergen_list = ", ".join(sorted(set(matched)))
+            warnings.append(
+                f"⚠️ {order_item.name} contains {allergen_list} (allergy on file)"
+            )
+            seen_dishes.add(order_item.name.lower())
+
     return warnings
 
 
@@ -282,7 +277,18 @@ MATCHING RULES:
 - If you cannot match an item at all, add it to unrecognized_items
 - NEVER include sold out items
 
-{f"RESTAURANT NOTES: {ai_context}" if ai_context else ""}
+{f"CONTEXT: {ai_context}" if ai_context else ""}
+
+REPLACEMENT RULE: If the customer says 'change X to Y', 'replace X with Y', or 'swap X for Y':
+- This is a SUBSTITUTION. Return ONLY the new item Y. Do NOT include item X.
+- QUANTITY PRIORITY (follow this order):
+  1. If the customer explicitly states a quantity for Y in their message, use THAT quantity.
+     Example: "replace 4 pizzas with 2 lemonades" → customer said 2 → return 2x Lemonade
+  2. If the customer does NOT state a quantity for Y, use the quantity of X from CONTEXT.
+     Example: "replace 4 pizzas with lemonade" (no quantity for lemonade) → use 4 → return 4x Lemonade
+  3. If no quantity can be determined, default to 1.
+- NEVER include both X and Y in the items array — X is being removed, Y is the replacement
+- Return ONLY the replacement item in the items array, nothing else
 
 Return ONLY this JSON format, no other text:
 {{

@@ -9,7 +9,7 @@ import re
 import json
 import hashlib
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from collections import defaultdict
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -60,25 +60,43 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class InMemoryRateLimiter:
-    """
-    Simple sliding-window rate limiter keyed by IP + endpoint.
-    For production multi-worker: replace with Redis-backed slowapi.
-    """
+    MAX_KEYS = 10_000
 
     def __init__(self):
-        self._windows: dict = defaultdict(list)
+        self._windows: dict[str, list] = {}
+        self._last_gc = datetime.now(timezone.utc)
+
+    def _gc(self):
+        now = datetime.now(timezone.utc)
+        if (now - self._last_gc).total_seconds() < 60:
+            return
+        self._last_gc = now
+        dead = [k for k, v in self._windows.items() if not v]
+        for k in dead:
+            del self._windows[k]
 
     def is_allowed(self, key: str, limit: int, window_seconds: int) -> bool:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         cutoff = now - timedelta(seconds=window_seconds)
 
-        # Clean expired entries
+        if key not in self._windows:
+            if len(self._windows) >= self.MAX_KEYS:
+                self._gc()
+                if len(self._windows) >= self.MAX_KEYS:
+                    return True  # fail-open under extreme load
+            self._windows[key] = []
+
         self._windows[key] = [t for t in self._windows[key] if t > cutoff]
+
+        if not self._windows[key]:
+            del self._windows[key]
+            self._windows[key] = []
 
         if len(self._windows[key]) >= limit:
             return False
 
         self._windows[key].append(now)
+        self._gc()
         return True
 
     def check(
@@ -145,6 +163,16 @@ INJECTION_PATTERNS = [
     # Research/educational bypass attempts
     r"for\s+(educational|research|academic|university|testing)\s+purposes",
     r"(hypothetically|theoretically)\s+(speaking\s*)?,?\s+(if\s+you\s+had\s+no|imagine)",
+    # Encoding bypass attempts
+    r"base64",
+    r"\\x[0-9a-fA-F]{2}",
+    r"\u202e",                        # Unicode right-to-left override
+    # Context manipulation
+    r"from\s+now\s+on",
+    r"in\s+this\s+conversation\s+you\s+will",
+    r"starting\s+now\s+your\s+role\s+is",
+    # Additional role takeover
+    r"your\s+true\s+self\s+is",
 ]
 
 COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in INJECTION_PATTERNS]
@@ -224,29 +252,34 @@ def sanitise_admin_context(text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SecurityEventTracker:
-    """
-    Tracks security events per user. Triggers session suspension
-    after repeated violations within a time window.
-    """
-
     def __init__(self):
-        self._events: dict = defaultdict(list)
+        self._events: dict[str, list] = {}
 
     def record(self, user_id: str, event_type: str, ip: str = ""):
+        if user_id not in self._events:
+            self._events[user_id] = []
         self._events[user_id].append({
             "type": event_type,
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.now(timezone.utc),
             "ip": ip,
         })
+        # Evict events older than 1 hour immediately after each write
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._events[user_id] = [
+            e for e in self._events[user_id]
+            if e["timestamp"] > cutoff
+        ]
+        # Remove key entirely if empty
+        if not self._events[user_id]:
+            del self._events[user_id]
 
-    def violation_count(self, user_id: str, window_minutes: int = 10) -> int:
-        cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
-        recent = [e for e in self._events[user_id] if e["timestamp"] > cutoff]
-        return len(recent)
-
-    def should_suspend(self, user_id: str) -> bool:
-        """Suspend after 3 security events in 10 minutes."""
-        return self.violation_count(user_id) >= 3
+    def should_suspend(self, user_id: str, window_minutes: int = 10, threshold: int = 3) -> bool:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+        recent = [
+            e for e in self._events.get(user_id, [])
+            if e["timestamp"] > cutoff
+        ]
+        return len(recent) >= threshold
 
 
 security_tracker = SecurityEventTracker()
@@ -275,7 +308,7 @@ async def audit_log(
     """
     try:
         db.table("audit_log").insert({
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "actor_id": actor_id,
             "actor_role": actor_role,
             "action": action,

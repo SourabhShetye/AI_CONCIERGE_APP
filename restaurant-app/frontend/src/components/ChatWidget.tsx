@@ -18,6 +18,8 @@ interface ChatState {
   pendingAction: PendingAction
   pendingOrderId: string | null
   pendingOrderNum: number | null
+  pendingAllergyInput: string | null
+  pendingQuantityOverride: number | null
 }
 
 const DEFAULT_STATE: ChatState = {
@@ -25,6 +27,8 @@ const DEFAULT_STATE: ChatState = {
   pendingAction: null,
   pendingOrderId: null,
   pendingOrderNum: null,
+  pendingAllergyInput: null,
+  pendingQuantityOverride: null,
 }
 
 function loadChatState(): ChatState {
@@ -56,6 +60,7 @@ export default function ChatWidget() {
   const [recording, setRecording] = useState(false)
   const [awaitingTable, setAwaitingTable] = useState(false)
   const [tableInput, setTableInput] = useState('')
+  const submittingRef = useRef(false)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -155,7 +160,8 @@ export default function ChatWidget() {
   }
 
   const sendMessage = async () => {
-    if (!input.trim() || loading) return
+    if (submittingRef.current || !input.trim() || loading) return
+    submittingRef.current = true
 
     if (input.length > 2000) {
       addMessage('assistant', 'Message too long. Please keep it under 2000 characters.')
@@ -185,12 +191,14 @@ export default function ChatWidget() {
         pending_action: chatState.pendingAction,
         pending_order_id: chatState.pendingOrderId,
         pending_order_num: chatState.pendingOrderNum,
+        pending_allergy_input: chatState.pendingAllergyInput,
+        pending_quantity_override: chatState.pendingQuantityOverride,
       })
 
       const {
         reply, new_mode, new_pending_action, new_pending_order_id, new_pending_order_num,
         order_placed, order_total, order_number, booking_placed, booking_summary,
-        booking_datetime_iso,
+        booking_datetime_iso, pending_allergy_input, pending_quantity_override,
       } = res.data
 
       setChatState({
@@ -198,11 +206,14 @@ export default function ChatWidget() {
         pendingAction: new_pending_action || null,
         pendingOrderId: new_pending_order_id || null,
         pendingOrderNum: new_pending_order_num || null,
+        pendingAllergyInput: pending_allergy_input ?? null,
+        pendingQuantityOverride: pending_quantity_override ?? null,
       })
 
       let displayReply = reply
       if (order_placed && order_total) {
         displayReply = `${reply}\n\n✅ Order #${order_number} placed! Total: AED ${Number(order_total).toFixed(2)}. Check your Orders tab.`
+        window.dispatchEvent(new CustomEvent('order_placed_via_chat'))
       } else if (booking_placed && booking_summary) {
         displayReply = `${reply}\n\n✅ Booking confirmed! ${booking_summary}. Check your Bookings tab.`
         // Fire event so Booking tab refreshes immediately
@@ -227,6 +238,7 @@ export default function ChatWidget() {
       setChatState(DEFAULT_STATE)
     } finally {
       setLoading(false)
+      submittingRef.current = false
     }
   }
 

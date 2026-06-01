@@ -11,7 +11,7 @@ Changes vs original:
 
 import hashlib
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -41,7 +41,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + (
+    expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     to_encode.update({"exp": expire, "type": "access"})
@@ -113,7 +113,7 @@ async def create_token_pair(
     # Refresh token — cryptographically random, 7 days
     raw_refresh = secrets.token_urlsafe(32)
     refresh_hash = _hash_refresh_token(raw_refresh)
-    expires_at = (datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)).isoformat()
 
     db.table("refresh_tokens").insert({
         "token_hash": refresh_hash,
@@ -157,7 +157,7 @@ async def rotate_refresh_token(db, raw_refresh_token: str) -> tuple[str, str]:
 
     # Check expiry
     expires_at = datetime.fromisoformat(token_record["expires_at"])
-    if datetime.utcnow() > expires_at:
+    if datetime.now(timezone.utc) > expires_at:
         raise HTTPException(status_code=401, detail="Refresh token expired.")
 
     # Revoke current token (rotation — one-time use)
@@ -203,8 +203,8 @@ async def check_account_lockout(db, name: str, restaurant_id: str):
     record = result.data[0]
     if record["failed_count"] >= MAX_FAILED_ATTEMPTS:
         locked_until = datetime.fromisoformat(record["locked_until"])
-        if datetime.utcnow() < locked_until:
-            remaining = int((locked_until - datetime.utcnow()).total_seconds() / 60)
+        if datetime.now(timezone.utc) < locked_until:
+            remaining = int((locked_until - datetime.now(timezone.utc)).total_seconds() / 60)
             raise HTTPException(
                 status_code=429,
                 detail=f"Account temporarily locked after too many failed attempts. "
@@ -227,9 +227,9 @@ async def record_failed_login(db, name: str, restaurant_id: str):
 
     if existing.data:
         new_count = existing.data[0]["failed_count"] + 1
-        update_data = {"failed_count": new_count, "last_attempt": datetime.utcnow().isoformat()}
+        update_data = {"failed_count": new_count, "last_attempt": datetime.now(timezone.utc).isoformat()}
         if new_count >= MAX_FAILED_ATTEMPTS:
-            lockout = (datetime.utcnow() + timedelta(minutes=LOCKOUT_DURATION_MINUTES)).isoformat()
+            lockout = (datetime.now(timezone.utc) + timedelta(minutes=LOCKOUT_DURATION_MINUTES)).isoformat()
             update_data["locked_until"] = lockout
         db.table("login_attempts").update(update_data).eq(
             "name", name
@@ -239,7 +239,7 @@ async def record_failed_login(db, name: str, restaurant_id: str):
             "name": name,
             "restaurant_id": restaurant_id,
             "failed_count": 1,
-            "last_attempt": datetime.utcnow().isoformat(),
+            "last_attempt": datetime.now(timezone.utc).isoformat(),
         }).execute()
 
 

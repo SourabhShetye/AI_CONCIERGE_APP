@@ -1,5 +1,4 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
-import ChatWidget from './components/ChatWidget'
 import { useAuth } from './contexts/AuthContext'
 import LandingPage from './components/LandingPage'
 import CustomerLogin from './components/customer/Login'
@@ -39,7 +38,16 @@ export default function App() {
           </ProtectedStaff>
         }
       />
-      <Route path="*" element={<Navigate to="/" replace />} />
+      <Route path="*" element={
+        <div className="min-h-screen flex flex-col items-center justify-center text-center p-6">
+          <div className="text-6xl mb-4">🍽️</div>
+          <h1 className="text-2xl font-bold text-gray-800 mb-2">Page not found</h1>
+          <p className="text-gray-500 mb-6">This page doesn't exist.</p>
+          <a href="/" className="px-4 py-2 bg-primary-500 text-white rounded-xl text-sm font-medium">
+            Go home
+          </a>
+        </div>
+      } />
     </Routes>
   )
 }

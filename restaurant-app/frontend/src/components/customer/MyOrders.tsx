@@ -12,6 +12,21 @@ const STATUS_LABELS: Record<string, string> = {
   cancelled: '❌ Cancelled',
 }
 
+function StatusBadge({ status }: { status: string }) {
+  const map: Record<string, string> = {
+    pending:   'bg-yellow-100 text-yellow-700',
+    preparing: 'bg-blue-100 text-blue-700',
+    ready:     'bg-green-100 text-green-700',
+    completed: 'bg-gray-100 text-gray-500',
+    cancelled: 'bg-red-100 text-red-500',
+  }
+  return (
+    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${map[status] || 'bg-gray-100 text-gray-500'}`}>
+      {status.charAt(0).toUpperCase() + status.slice(1)}
+    </span>
+  )
+}
+
 function groupOrdersByDate(orders: Order[]): Record<string, Order[]> {
   const groups: Record<string, Order[]> = {}
   for (const order of orders) {
@@ -60,9 +75,9 @@ export default function MyOrders() {
   }
 
   useEffect(() => {
-    fetchOrders()
-    const interval = setInterval(fetchOrders, 5000)
-    return () => clearInterval(interval)
+    const handler = () => fetchOrders()
+    window.addEventListener('order_placed_via_chat', handler)
+    return () => window.removeEventListener('order_placed_via_chat', handler)
   }, [])
 
   // Refresh immediately when user switches back to this tab
@@ -106,8 +121,14 @@ export default function MyOrders() {
   }
 
   if (loading) return (
-    <div className="flex items-center justify-center h-64 text-gray-400">
-      Loading orders...
+    <div className="p-4 space-y-3">
+      {[1,2,3].map(i => (
+        <div key={i} className="bg-white rounded-2xl p-4 animate-pulse">
+          <div className="h-4 bg-gray-200 rounded w-1/3 mb-3" />
+          <div className="h-3 bg-gray-100 rounded w-2/3 mb-2" />
+          <div className="h-3 bg-gray-100 rounded w-1/2" />
+        </div>
+      ))}
     </div>
   )
 
@@ -127,9 +148,12 @@ export default function MyOrders() {
       </div>
 
       {orders.length === 0 && (
-        <div className="card text-center py-12 text-gray-400">
-          <p className="text-4xl mb-3">🍽️</p>
-          <p>No orders yet. Start by ordering from the menu!</p>
+        <div className="flex flex-col items-center justify-center py-20 text-center px-6">
+          <div className="text-5xl mb-4">🍽️</div>
+          <h3 className="font-semibold text-gray-700 mb-1">No orders yet</h3>
+          <p className="text-sm text-gray-400">
+            Use the chat or menu tab to place your first order.
+          </p>
         </div>
       )}
 
@@ -219,7 +243,7 @@ function OrderCard({
             })}
           </p>
         </div>
-        <span className={`status-${order.status}`}>{STATUS_LABELS[order.status]}</span>
+        <StatusBadge status={order.status} />
       </div>
 
       {order.items.map((item, i) => (

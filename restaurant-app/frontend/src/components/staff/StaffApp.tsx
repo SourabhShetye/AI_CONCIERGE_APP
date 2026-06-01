@@ -203,6 +203,7 @@ const ALL_TABS = [
 
 export default function StaffApp() {
   const { user, logout } = useAuth()
+  const [activeOrderCount, setActiveOrderCount] = useState(0)
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -225,6 +226,24 @@ export default function StaffApp() {
     })
     return () => { unsub(); ws.disconnect() }
   }, [user?.user_id])
+
+  useEffect(() => {
+    if (!user) return
+
+    const fetchActiveOrders = async () => {
+      try {
+        const res = await api.get('/api/staff/orders')
+        const active = Array.isArray(res.data) ? res.data.length : 0
+        setActiveOrderCount(active)
+      } catch {
+        setActiveOrderCount(0)
+      }
+    }
+
+    fetchActiveOrders()
+    const interval = setInterval(fetchActiveOrders, 30000)
+    return () => clearInterval(interval)
+  }, [user])
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -261,6 +280,11 @@ export default function StaffApp() {
             >
               <Icon size={16} />
               {label}
+              {path === '/staff/kitchen' && activeOrderCount > 0 && (
+                <span className="ml-1 bg-red-500 text-white text-xs rounded-full px-1.5 py-0.5 font-bold">
+                  {activeOrderCount}
+                </span>
+              )}
             </button>
           )
         })}

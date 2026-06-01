@@ -19,6 +19,14 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# Module-level singleton — instantiated once, reused across all requests
+_groq_client: Optional[Groq] = None
+
+def get_groq_client() -> Groq:
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=settings.groq_api_key)
+    return _groq_client
 
 class ChatMode(str, Enum):
     general  = "general"
@@ -172,6 +180,7 @@ async def process_chat(
     pending_order_id: str | None = None,     # order id waiting for details
     pending_order_num: int | None = None,    # order number waiting for details
     active_orders: list = [],                # passed in from main.py (already queried)
+    active_order_context: str = "",
 ) -> dict:
     """
     Process a chat message through the state machine.
@@ -726,7 +735,7 @@ RULES:
 2. If asked about cancelling or modifying, tell them to type "cancel order" or "modify order".
 3. Keep responses concise — max 3 sentences."""
 
-    client = Groq(api_key=settings.groq_api_key)
+    client = get_groq_client()
     messages = conversation_history[-6:] + [{"role": "user", "content": message}]
 
     try:
@@ -761,4 +770,5 @@ RULES:
         return result
 
     result["reply"] = reply
+
     return result

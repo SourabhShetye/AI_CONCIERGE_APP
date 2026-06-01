@@ -45,7 +45,10 @@ export default function CustomerLogin() {
     sessionStorage.clear()  // always start fresh — prevents stale staff tokens bleeding in
     setLoading(true)
     try {
-      const payload = { name: name.trim(), pin, restaurant_id: restaurantId, table_number: tableNumber || undefined }
+      const formattedName = name.trim().split(' ')
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ')
+      const payload = { name: formattedName, pin, restaurant_id: restaurantId, table_number: tableNumber || undefined }
       const res = mode === 'login'
         ? await authApi.customerLogin(payload)
         : await authApi.customerRegister({

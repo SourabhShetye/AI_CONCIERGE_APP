@@ -55,11 +55,32 @@ from app.crm import compute_tags, build_welcome_message
 from app.websocket import manager
 from datetime import date as _date
 
+# These appear inside functions — move to top level
+from app.booking_service import is_restaurant_open_for_booking
+from app.booking_service import get_tables_booked_in_slot, find_best_table, get_available_slots
+from app.chat_service import get_items_summary
+from app.models import OrderItem
+from contextlib import asynccontextmanager
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Restaurant AI Concierge API", version="2.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    logger.info("✅ Database client initialised")
+    yield
 
+app = FastAPI(title="Restaurant AI Concierge API", version="2.0.0", lifespan=lifespan)
+
+def parse_order_items(order: dict) -> dict:
+    """Parse items field from JSON string to list if needed. Mutates in place."""
+    if isinstance(order.get("items"), str):
+        try:
+            order["items"] = json.loads(order["items"])
+        except Exception:
+            order["items"] = []
+    return order
 
 async def get_next_order_number(db, restaurant_id: str) -> int:
     """
@@ -78,12 +99,21 @@ async def get_next_order_number(db, restaurant_id: str) -> int:
         }).execute()
 
         if result.data is not None:
-            # Supabase RPC returns scalar as int directly, or wrapped in list
             val = result.data
-            if isinstance(val, list):
-                val = val[0]
-            if isinstance(val, int) and val > 0:
-                return val
+            # Handle all Supabase RPC return formats:
+            # [5], [{"increment_order_number": 5}], 5
+            if isinstance(val, list) and len(val) > 0:
+                first = val[0]
+                if isinstance(first, dict):
+                    val = first.get("increment_order_number") or next(iter(first.values()))
+                else:
+                    val = first
+            try:
+                val = int(val)
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
         # Fallback if RPC not available — use non-atomic method with warning
         logger.warning("increment_order_number RPC not found, using non-atomic fallback")
         existing = db.table("order_number_sequences").select("*").eq(
@@ -125,15 +155,20 @@ app.add_middleware(
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
-@app.on_event("startup")
-async def startup():
-    init_db()
-    logger.info("✅ Database client initialised")
-
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "2.0.0"}
+    db_ok = False
+    try:
+        db = get_db()
+        result = db.table("restaurants").select("id").limit(1).execute()
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "version": "2.0.0",
+        "database": "connected" if db_ok else "unreachable",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -378,6 +413,18 @@ async def delete_account(current_user: dict = Depends(require_customer)):
         f"GDPR_ERASURE: user_id={user_id} pii_anonymised=true health_data_deleted=true "
         f"timestamp={datetime.now(timezone.utc).isoformat()}"
     )
+    await audit_log(
+        db,
+        actor_id=user_id,
+        actor_role="customer",
+        action="GDPR_ERASURE",
+        resource_type="user_session",
+        resource_id=user_id,
+        restaurant_id=current_user.get("restaurant_id", ""),
+        ip_address="",
+        outcome="success",
+        details={"pii_anonymised": True, "health_data_deleted": True},
+    )
     return {"detail": "Your account and personal data have been deleted."}
 
 
@@ -445,7 +492,7 @@ async def get_menu(restaurant_id: Optional[str] = None):
     return result.data
 
 
-@app.post("/api/staff/menu", dependencies=[Depends(require_staff)])
+@app.post("/api/staff/menu")
 async def create_menu_item(item: MenuItemCreate, current_user: dict = Depends(require_staff)):
     db = get_db()
     result = db.table("menu_items").insert({
@@ -578,11 +625,7 @@ async def get_customer_orders(current_user: dict = Depends(get_current_user)):
     orders = result.data
     logger.info(f"Found {len(orders)} orders for user={current_user['user_id']}")
     for o in orders:
-        if isinstance(o.get("items"), str):
-            try:
-                o["items"] = json.loads(o["items"])
-            except Exception:
-                o["items"] = []
+        parse_order_items(o)
     return orders
 
 
@@ -604,7 +647,6 @@ async def modify_order(
         raise HTTPException(status_code=409, detail="Order cannot be modified at this stage.")
 
     current_items_raw = json.loads(o["items"]) if isinstance(o["items"], str) else o["items"]
-    from app.models import OrderItem
     current_items = [OrderItem(**i) for i in current_items_raw]
 
     menu = db.table("menu_items").select("*").eq("restaurant_id", o["restaurant_id"]).execute()
@@ -657,7 +699,7 @@ async def cancel_order(order_id: str, current_user: dict = Depends(require_custo
 # STAFF ORDER ACTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/staff/orders", dependencies=[Depends(require_staff)])
+@app.get("/api/staff/orders")
 async def kitchen_orders(current_user: dict = Depends(require_staff)):
     db = get_db()
     result = (
@@ -670,12 +712,11 @@ async def kitchen_orders(current_user: dict = Depends(require_staff)):
     )
     orders = result.data
     for o in orders:
-        if isinstance(o.get("items"), str):
-            o["items"] = json.loads(o["items"])
+        parse_order_items(o)
     return orders
 
 
-@app.put("/api/staff/orders/{order_id}/ready", dependencies=[Depends(require_staff)])
+@app.put("/api/staff/orders/{order_id}/ready")
 async def mark_order_ready(order_id: str, current_user: dict = Depends(require_staff)):
     db = get_db()
     order = db.table("orders").select("*").eq("id", order_id).execute()
@@ -870,8 +911,7 @@ async def staff_chat(
     ).data or []
 
     for o in active_orders:
-        if isinstance(o.get("items"), str):
-            o["items"] = json.loads(o["items"])
+        parse_order_items(o)
 
     from datetime import timedelta as _td
     now = datetime.now(timezone.utc)
@@ -948,7 +988,7 @@ async def staff_chat(
 # TABLES & BILLING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/staff/tables", dependencies=[Depends(require_staff)])
+@app.get("/api/staff/tables")
 async def live_tables(current_user: dict = Depends(require_staff)):
     """Group active orders by table number."""
     db = get_db()
@@ -961,8 +1001,7 @@ async def live_tables(current_user: dict = Depends(require_staff)):
     )
     orders = result.data
     for o in orders:
-        if isinstance(o.get("items"), str):
-            o["items"] = json.loads(o["items"])
+        parse_order_items(o)
 
     tables: dict = {}
     for o in orders:
@@ -975,7 +1014,7 @@ async def live_tables(current_user: dict = Depends(require_staff)):
     return list(tables.values())
 
 
-@app.post("/api/staff/tables/{table_number}/close", dependencies=[Depends(require_staff)])
+@app.post("/api/staff/tables/{table_number}/close")
 async def close_table(table_number: str, current_user: dict = Depends(require_staff)):
     db = get_db()
     restaurant_id = current_user["restaurant_id"]
@@ -1009,19 +1048,23 @@ async def close_table(table_number: str, current_user: dict = Depends(require_st
     total = sum(float(o.get("price", 0)) for o in orders.data)
     user_ids = list({o["user_id"] for o in orders.data if o.get("user_id")})
 
-    for o in orders.data:
-        try:
-            db.table("orders").update({"status": "completed"}).eq("id", o["id"]).execute()
-        except Exception as e:
-            logger.error(f"Failed to mark order {o['id']} completed: {e}")
+    # Batch update all orders to completed in one query
+    order_ids = [o["id"] for o in orders.data]
+    try:
+        db.table("orders").update({"status": "completed"}).in_("id", order_ids).execute()
+    except Exception as e:
+        logger.error(f"Failed to batch complete orders: {e}")
 
     crm_errors = []
+    # Batch fetch all users in one query instead of N separate queries
+    all_users_result = db.table("user_sessions").select("*").in_("id", user_ids).execute()
+    users_by_id = {u["id"]: u for u in (all_users_result.data or [])}
+
     for uid in user_ids:
         try:
-            user = db.table("user_sessions").select("*").eq("id", uid).execute()
-            if not user.data:
+            u = users_by_id.get(uid)
+            if not u:
                 continue
-            u = user.data[0]
             new_visit = int(u.get("visit_count") or 0) + 1
             # Per-user spend: sum this user's own orders only
             user_orders_total = sum(
@@ -1115,8 +1158,7 @@ async def get_my_bill(current_user: dict = Depends(get_current_user)):
 
     active_orders = active_result.data or []
     for o in active_orders:
-        if isinstance(o.get("items"), str):
-            o["items"] = json.loads(o["items"])
+        parse_order_items(o)
 
     active_total = round(sum(float(o.get("price", 0)) for o in active_orders), 2)
 
@@ -1132,8 +1174,7 @@ async def get_my_bill(current_user: dict = Depends(get_current_user)):
 
     past_orders = past_result.data or []
     for o in past_orders:
-        if isinstance(o.get("items"), str):
-            o["items"] = json.loads(o["items"])
+        parse_order_items(o)
 
     from collections import defaultdict
     past_by_date: dict = defaultdict(list)
@@ -1185,8 +1226,7 @@ async def get_bill(table_number: str, restaurant_id: Optional[str] = None):
     )
     orders = result.data
     for o in orders:
-        if isinstance(o.get("items"), str):
-            o["items"] = json.loads(o["items"])
+        parse_order_items(o)
 
     total = sum(float(o.get("price", 0)) for o in orders)
     return {"table_number": table_number, "orders": orders, "total": round(total, 2)}
@@ -1196,7 +1236,7 @@ async def get_bill(table_number: str, restaurant_id: Optional[str] = None):
 # TABLE INVENTORY MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/staff/tables-inventory", dependencies=[Depends(require_staff)])
+@app.get("/api/staff/tables-inventory")
 async def get_tables_inventory(current_user: dict = Depends(require_staff)):
     db = get_db()
     result = (
@@ -1209,7 +1249,7 @@ async def get_tables_inventory(current_user: dict = Depends(require_staff)):
     return result.data
 
 
-@app.post("/api/staff/tables-inventory", dependencies=[Depends(require_staff)])
+@app.post("/api/staff/tables-inventory")
 async def create_table(table_data: dict, current_user: dict = Depends(require_staff)):
     db = get_db()
     result = db.table("tables_inventory").insert({
@@ -1244,7 +1284,7 @@ async def delete_table(table_id: str):
 
 # ─── Table availability rules ────────────────────────────────────────────────
 
-@app.get("/api/staff/availability-rules", dependencies=[Depends(require_staff)])
+@app.get("/api/staff/availability-rules")
 async def get_availability_rules(current_user: dict = Depends(require_staff)):
     db = get_db()
     rules = db.table("table_availability_rules").select(
@@ -1253,7 +1293,7 @@ async def get_availability_rules(current_user: dict = Depends(require_staff)):
     return rules.data
 
 
-@app.post("/api/staff/availability-rules", dependencies=[Depends(require_staff)])
+@app.post("/api/staff/availability-rules")
 async def create_availability_rule(rule: dict, current_user: dict = Depends(require_staff)):
     db = get_db()
     rule["restaurant_id"] = current_user["restaurant_id"]
@@ -1278,7 +1318,7 @@ async def delete_availability_rule(rule_id: str):
 
 # ─── Restaurant blackout dates ────────────────────────────────────────────────
 
-@app.get("/api/staff/blackout-dates", dependencies=[Depends(require_staff)])
+@app.get("/api/staff/blackout-dates")
 async def get_blackout_dates(current_user: dict = Depends(require_staff)):
     db = get_db()
     result = db.table("restaurant_blackout_dates").select("*").eq(
@@ -1287,7 +1327,7 @@ async def get_blackout_dates(current_user: dict = Depends(require_staff)):
     return result.data
 
 
-@app.post("/api/staff/blackout-dates", dependencies=[Depends(require_staff)])
+@app.post("/api/staff/blackout-dates")
 async def create_blackout_date(data: dict, current_user: dict = Depends(require_staff)):
     db = get_db()
     data["restaurant_id"] = current_user["restaurant_id"]
@@ -1361,7 +1401,7 @@ async def create_booking(
         blackout_result = db.table("restaurant_blackout_dates").select("*").eq(
             "restaurant_id", restaurant_id
         ).execute()
-        from app.booking_service import is_restaurant_open_for_booking
+        
         open_ok, open_err = is_restaurant_open_for_booking(booking_time, blackout_result.data or [])
         if not open_ok:
             raise HTTPException(status_code=409, detail=open_err)
@@ -1387,12 +1427,6 @@ async def create_booking(
         )
 
         if tables_result.data:
-            from app.booking_service import (
-                get_tables_booked_in_slot,
-                find_best_table,
-                get_available_slots,
-            )
-
             rules_result = db.table("table_availability_rules").select("*").eq(
                 "restaurant_id", restaurant_id
             ).execute()
@@ -1635,7 +1669,7 @@ async def request_cancellation(
     return {"detail": f"Cancellation request sent to kitchen for Order #{order_num}. Request: {cancel_desc}"}
 
 
-@app.get("/api/staff/bookings", dependencies=[Depends(require_staff)])
+@app.get("/api/staff/bookings")
 async def staff_get_bookings(current_user: dict = Depends(require_staff)):
     db = get_db()
     result = (
@@ -1662,7 +1696,7 @@ async def staff_cancel_booking(booking_id: str):
     return {"detail": "Booking cancelled."}
 
 
-@app.delete("/api/staff/bookings/{booking_id}/purge", dependencies=[Depends(require_staff)])
+@app.delete("/api/staff/bookings/{booking_id}/purge")
 async def purge_booking(booking_id: str, current_user: dict = Depends(require_staff)):
     """Permanently delete a cancelled booking record."""
     db = get_db()
@@ -1682,7 +1716,7 @@ async def purge_booking(booking_id: str, current_user: dict = Depends(require_st
 # CRM
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/staff/crm", dependencies=[Depends(require_staff)])
+@app.get("/api/staff/crm")
 async def get_crm(current_user: dict = Depends(require_staff)):
     db = get_db()
     restaurant_id = current_user["restaurant_id"]
@@ -1736,7 +1770,7 @@ async def get_crm(current_user: dict = Depends(require_staff)):
 # SETTINGS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/staff/settings", dependencies=[Depends(require_staff)])
+@app.get("/api/staff/settings")
 async def get_settings(current_user: dict = Depends(require_staff)):
     db = get_db()
     result = db.table("restaurant_policies").select("*").eq(
@@ -1745,7 +1779,7 @@ async def get_settings(current_user: dict = Depends(require_staff)):
     return result.data[0] if result.data else {}
 
 
-@app.put("/api/staff/settings", dependencies=[Depends(require_staff)])
+@app.put("/api/staff/settings")
 async def update_settings(req: RestaurantSettings, current_user: dict = Depends(require_staff)):
     db = get_db()
     rid = current_user["restaurant_id"]
@@ -1763,7 +1797,7 @@ async def update_settings(req: RestaurantSettings, current_user: dict = Depends(
 # STAFF USER MANAGEMENT (admin only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/api/staff/users", dependencies=[Depends(require_admin)])
+@app.post("/api/staff/users")
 async def create_staff_user(req: StaffUserCreate, current_user: dict = Depends(require_admin)):
     db = get_db()
     result = db.table("staff_users").insert({
@@ -1788,6 +1822,8 @@ class ChatRequest(BaseModel):
     pending_action: Optional[str] = None
     pending_order_id: Optional[str] = None
     pending_order_num: Optional[int] = None
+    pending_allergy_input: Optional[str] = None
+    pending_quantity_override: Optional[int] = None
 
 
 @app.post("/api/chat")
@@ -1862,6 +1898,36 @@ async def chat(req: ChatRequest, request: Request, current_user: dict = Depends(
     ).order("daily_order_number").execute()
     active_orders = active_orders_result.data or []
 
+    # Build active order context BEFORE calling process_chat
+    # so the pre-parse inside chat_service has quantity context for replacements
+    active_order_context = ""
+    if active_orders:
+        import re as _re
+        msg_lower_check = clean_message.lower()
+        REPLACEMENT_WORDS = [
+            "replace", "change", "swap", "instead", "switch",
+            "no i want", "actually", "forget", "cancel that"
+        ]
+        is_replacement_check = any(w in msg_lower_check for w in REPLACEMENT_WORDS)
+        has_explicit_quantity = bool(_re.search(r'\b\d+\b', clean_message))
+
+        if is_replacement_check and not has_explicit_quantity:
+            active_items = []
+            # Use ONLY the most recent active order for quantity context
+            latest = max(active_orders, key=lambda o: o.get("created_at", ""))
+            items_raw = latest.get("items", "[]")
+            items_list = json.loads(items_raw) if isinstance(items_raw, str) else items_raw
+            for item in items_list:
+                active_items.append(
+                    f"{item.get('quantity', 1)}x {item.get('name', '')}"
+                )
+            if active_items:
+                active_order_context = (
+                    f"REFERENCE ONLY (do not re-order these): "
+                    f"Customer currently has {', '.join(active_items)} in their active orders. "
+                    f"Use these quantities for replacements only. "
+                )
+
     from app.chat_service import process_chat
     try:
         result = await process_chat(
@@ -1877,6 +1943,7 @@ async def chat(req: ChatRequest, request: Request, current_user: dict = Depends(
             pending_order_id=req.pending_order_id,
             pending_order_num=req.pending_order_num,
             active_orders=active_orders,
+            active_order_context=active_order_context,
         )
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
@@ -1933,7 +2000,7 @@ async def chat(req: ChatRequest, request: Request, current_user: dict = Depends(
                     items_list = []
                     items_summary = ""
                     if full_order.data:
-                        from app.chat_service import get_items_summary
+                        
                         items_list, items_summary = get_items_summary(full_order.data[0])
 
                     await manager.broadcast_to_kitchen(restaurant_id, "modification_request", {
@@ -1968,21 +2035,78 @@ async def chat(req: ChatRequest, request: Request, current_user: dict = Depends(
     is_actual_order = mode_is_ordering and not skip_order and len(clean_message.strip()) > 3
 
     if is_actual_order and req.table_number:
-        logger.info(f"Attempting order: '{clean_message}' table={req.table_number}")
+        import json as _json
+        import re as _re2
+        from app.order_service import process_natural_language_order
+
+        CONFIRMATION_WORDS = [
+            "yes", "confirm", "go ahead", "place it", "order anyway",
+            "i know", "i understand", "proceed", "ok", "okay", "sure",
+            "i'll take the risk", "still want", "still order"
+        ]
+        REPLACEMENT_WORDS = [
+            "replace", "change", "swap", "instead", "switch",
+            "no i want", "actually", "forget", "cancel that"
+        ]
+
+        allergy_confirmed = any(w in clean_message.lower() for w in CONFIRMATION_WORDS)
+        is_replacement = any(w in clean_message.lower() for w in REPLACEMENT_WORDS)
+
+        # Determine what text to send to Groq
+        if allergy_confirmed and req.pending_allergy_input and not is_replacement:
+            order_input = req.pending_allergy_input
+            logger.info(f"Allergy confirmation — using stored order: '{order_input}'")
+        elif is_replacement and req.pending_allergy_input:
+            order_input = clean_message
+            result["pending_allergy_input"] = None
+            allergy_confirmed = False
+            logger.info(f"Allergy replacement — fresh order: '{order_input}'")
+        else:
+            order_input = clean_message
+
+        # Determine quantity override
+        # Priority 1: restored from previous allergy-gate turn (confirm path)
+        # Priority 2: computed from latest active order (replacement path)
+        quantity_override = None
+
+        if allergy_confirmed and req.pending_allergy_input and req.pending_quantity_override:
+            quantity_override = req.pending_quantity_override
+            logger.info(f"Restored quantity override from pending: {quantity_override}")
+        elif is_replacement and active_orders:
+            has_explicit_qty = bool(_re2.search(r'\b\d+\b', clean_message))
+            if not has_explicit_qty:
+                latest = max(active_orders, key=lambda o: o.get("created_at", ""))
+                items_raw = latest.get("items", "[]")
+                items_list = _json.loads(items_raw) if isinstance(items_raw, str) else items_raw
+                quantity_override = sum(int(i.get("quantity", 1)) for i in items_list)
+                logger.info(f"Quantity override from latest order: {quantity_override}")
+
+        logger.info(f"Parsing: '{order_input}' qty_override={quantity_override}")
+
         try:
-            import json as _json
-            from app.order_service import process_natural_language_order
-            parsed = await process_natural_language_order(clean_message, menu.data, allergies, ai_context)
+            parsed = await process_natural_language_order(
+                order_input,
+                menu.data,
+                allergies,
+                ai_context,
+            )
+
             if parsed.items:
+                # Work with raw dicts to avoid Pydantic model recalculation issues
+                raw_items = [i.model_dump() for i in parsed.items]
+
+                if quantity_override:
+                    for item in raw_items:
+                        item["quantity"] = quantity_override
+                        item["total_price"] = round(float(item["unit_price"]) * quantity_override, 2)
+
+                final_total = round(sum(i["total_price"] for i in raw_items), 2)
+                logger.info(f"Final order: {raw_items[0]['quantity']}x {raw_items[0]['name']} AED {final_total}")
+
                 allergy_warnings_found = parsed.allergy_warnings or []
-                allergy_confirmed = any(word in clean_message.lower() for word in [
-                    "yes", "confirm", "go ahead", "place it", "order anyway",
-                    "i know", "i understand", "proceed", "ok", "okay", "sure",
-                    "i'll take the risk", "still want", "still order"
-                ])
 
                 if allergy_warnings_found and not allergy_confirmed:
-                    warnings_text = "\n".join([f"⚠️ {w}" for w in allergy_warnings_found])
+                    warnings_text = "\n".join(allergy_warnings_found)
                     result["reply"] = (
                         f"Before I place this order, I need to let you know:\n\n"
                         f"{warnings_text}\n\n"
@@ -1993,6 +2117,8 @@ async def chat(req: ChatRequest, request: Request, current_user: dict = Depends(
                     )
                     result["order_placed"] = False
                     result["allergy_gate"] = True
+                    result["pending_allergy_input"] = order_input
+                    result["pending_quantity_override"] = quantity_override
                 else:
                     daily_number = await get_next_order_number(db, restaurant_id)
                     order_data = {
@@ -2000,8 +2126,8 @@ async def chat(req: ChatRequest, request: Request, current_user: dict = Depends(
                         "user_id": user_id,
                         "customer_name": customer_name,
                         "table_number": req.table_number,
-                        "items": _json.dumps([i.model_dump() for i in parsed.items]),
-                        "price": parsed.total,
+                        "items": _json.dumps(raw_items),
+                        "price": final_total,
                         "status": "pending",
                         "cancellation_status": "none",
                         "modification_status": "none",
@@ -2010,24 +2136,43 @@ async def chat(req: ChatRequest, request: Request, current_user: dict = Depends(
                     }
                     order_result = db.table("orders").insert(order_data).execute()
                     order = order_result.data[0]
+
                     await manager.broadcast_to_kitchen(restaurant_id, "new_order", {
                         "order_id": order["id"],
                         "order_number": daily_number,
                         "table_number": req.table_number,
                         "customer_name": customer_name,
-                        "items": [i.model_dump() for i in parsed.items],
-                        "total": parsed.total,
+                        "items": raw_items,
+                        "total": final_total,
                         "allergy_warnings": allergy_warnings_found,
                     })
+
                     result["order_placed"] = True
                     result["order_id"] = order["id"]
-                    result["order_total"] = parsed.total
+                    result["order_total"] = final_total
                     result["order_number"] = daily_number
-                    logger.info(f"Order #{daily_number} placed: {order['id']}")
+                    result["pending_allergy_input"] = None
+                    result["pending_quantity_override"] = None
+                    item_summary = ", ".join(
+                        f"{i['quantity']}x {i['name']}" for i in raw_items
+                    )
+                    logger.info(
+                        f"Order #{daily_number} placed: {item_summary} — "
+                        f"AED {final_total} — table={req.table_number} — user={user_id}"
+                    )
+
             else:
-                logger.info(f"No items parsed — unrecognized: {parsed.unrecognized_items}")
+                if allergy_confirmed and req.pending_allergy_input:
+                    result["reply"] = "Sorry, I lost track of your order. Could you tell me what you'd like again?"
+                    result["pending_allergy_input"] = None
+                    result["pending_quantity_override"] = None
+                else:
+                    logger.info(f"No items parsed — unrecognized: {parsed.unrecognized_items}")
+
         except Exception as e:
             logger.warning(f"Auto-order failed: {e}")
+            result["pending_allergy_input"] = None
+            result["pending_quantity_override"] = None
 
     reply_lower = result.get("reply", "").lower()
     logger.info(f"Booking trigger — mode={result.get('new_mode')} reply='{result.get('reply','')[:80]}'")
